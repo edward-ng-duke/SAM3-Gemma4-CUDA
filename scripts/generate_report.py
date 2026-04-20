@@ -90,20 +90,20 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
 #toolbar { display: flex; gap: 8px; margin: 12px 0 20px; flex-wrap: wrap; position: sticky; top: 0; background: #f7f7f7; padding: 8px 0; z-index: 10; }
 #toolbar input, #toolbar select { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem; background: white; }
 #toolbar input { flex: 1; min-width: 200px; }
-#grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-.card { background: white; border: 2px solid #e5e5e5; border-radius: 10px; padding: 10px 14px; transition: border-color 0.15s; }
+#grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fill, minmax(720px, 1fr)); }
+.card { background: white; border: 2px solid #e5e5e5; border-radius: 10px; padding: 14px 18px; transition: border-color 0.15s; }
 .card[open] { border-color: #4682B4; }
-.card > summary { display: flex; align-items: center; gap: 10px; cursor: pointer; list-style: none; }
+.card > summary { display: flex; align-items: center; gap: 10px; cursor: pointer; list-style: none; padding: 4px 0; }
 .card > summary::-webkit-details-marker { display: none; }
-.thumb { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; background: #eee; flex-shrink: 0; }
-.filename { flex: 1; font-size: 0.9rem; font-family: "IBM Plex Mono", ui-monospace, monospace; word-break: break-all; line-height: 1.3; }
-.badge { font-weight: 700; padding: 4px 12px; border-radius: 999px; font-size: 0.85rem; flex-shrink: 0; color: white; }
-.count-bucket-0 .badge { background: #999; }
-.count-bucket-1 .badge { background: #4682B4; }
-.count-bucket-2 .badge { background: #2e8b57; }
-.count-bucket-3 .badge { background: #e67e22; }
-.count-bucket-ge4 .badge { background: #8e44ad; }
-.count-bucket-err .badge { background: #c0392b; }
+.filename { flex: 1; font-size: 1rem; font-family: "IBM Plex Mono", ui-monospace, monospace; word-break: break-all; line-height: 1.3; }
+.badge { font-weight: 700; padding: 5px 14px; border-radius: 999px; font-size: 0.9rem; flex-shrink: 0; color: white; }
+.badge-sam { background: #555; }
+.badge-gemma.count-bucket-0 { background: #999; }
+.badge-gemma.count-bucket-1 { background: #4682B4; }
+.badge-gemma.count-bucket-2 { background: #2e8b57; }
+.badge-gemma.count-bucket-3 { background: #e67e22; }
+.badge-gemma.count-bucket-ge4 { background: #8e44ad; }
+.badge-gemma.count-bucket-err { background: #c0392b; }
 .card .body { padding-top: 12px; border-top: 1px solid #eee; margin-top: 10px; }
 .images { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
 .images figure { margin: 0; }
@@ -182,7 +182,13 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
             rel_image = ""
 
         stem = Path(image_name).stem if image_name else ""
-        rel_overlay = f"visualizations/{stem}_overlay.png" if stem else ""
+        rel_sam = f"visualizations/{stem}_sam.png" if stem else ""
+        rel_gemma = f"visualizations/{stem}_gemma.png" if stem else ""
+
+        try:
+            sam_person_count = int((item.get("per_prompt_counts") or {}).get("person", 0))
+        except (TypeError, ValueError):
+            sam_person_count = 0
 
         # Badge text
         if status == "error":
@@ -211,34 +217,39 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
         status_attr = html_escape(status, quote=True)
         name_attr = html_escape(name_lower, quote=True)
         count_attr = html_escape(str(num_persons), quote=True)
-        rel_image_attr = html_escape(rel_image, quote=True)
-        rel_overlay_attr = html_escape(rel_overlay, quote=True)
+        rel_sam_attr = html_escape(rel_sam, quote=True)
+        rel_gemma_attr = html_escape(rel_gemma, quote=True)
 
         parts_html.append(
-            f'    <details class="card status-{html_escape(status, quote=True)} count-bucket-{bucket}" '
+            f'    <details open class="card status-{html_escape(status, quote=True)} count-bucket-{bucket}" '
             f'data-count="{count_attr}" data-status="{status_attr}" data-name="{name_attr}">'
         )
         parts_html.append("      <summary>")
         parts_html.append(
-            f'        <img class="thumb" src="{rel_image_attr}" loading="lazy" alt="">'
-        )
-        parts_html.append(
             f'        <span class="filename">{html_escape(image_name)}</span>'
         )
-        parts_html.append(
-            f'        <span class="badge">{html_escape(badge_text)}</span>'
-        )
+        if status == "error":
+            parts_html.append(
+                f'        <span class="badge badge-gemma count-bucket-err">{html_escape(badge_text)}</span>'
+            )
+        else:
+            parts_html.append(
+                f'        <span class="badge badge-sam">SAM {sam_person_count}</span>'
+            )
+            parts_html.append(
+                f'        <span class="badge badge-gemma count-bucket-{bucket}">Gemma {html_escape(badge_text)}</span>'
+            )
         parts_html.append("      </summary>")
         parts_html.append('      <div class="body">')
 
         if status == "ok":
-            # Side-by-side images
+            # Side-by-side: SAM raw | Gemma grouped
             parts_html.append('        <div class="images">')
             parts_html.append(
-                f'          <figure><figcaption>Original</figcaption><img src="{rel_image_attr}" loading="lazy"></figure>'
+                f'          <figure><figcaption>SAM raw (by prompt)</figcaption><img src="{rel_sam_attr}" loading="lazy"></figure>'
             )
             parts_html.append(
-                f'          <figure><figcaption>Overlay</figcaption><img src="{rel_overlay_attr}" loading="lazy"></figure>'
+                f'          <figure><figcaption>Gemma grouped (by person)</figcaption><img src="{rel_gemma_attr}" loading="lazy"></figure>'
             )
             parts_html.append("        </div>")
 
