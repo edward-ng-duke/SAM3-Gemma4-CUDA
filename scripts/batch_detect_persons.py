@@ -10,6 +10,20 @@ from pathlib import Path
 PROMPTS = ["person", "face", "head", "hands", "arm", "shoulder", "torso", "legs", "feet"]
 DEFAULT_CONF_THRESH = 0.45
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+PERSON_COLORS = [
+    (255, 230, 0),    # yellow (from MASK_COLORS)
+    (255, 99, 132),   # pink
+    (54, 162, 235),   # blue
+    (75, 192, 192),   # teal
+    (153, 102, 255),  # purple
+    (255, 159, 64),   # orange
+    (46, 204, 113),   # green
+    (231, 76, 60),    # red
+    (26, 188, 156),   # turquoise
+    (241, 196, 15),   # dark yellow
+    (142, 68, 173),   # violet
+    (52, 152, 219),   # sky blue
+]
 
 
 def _clamp_box_xyxy(box, width, height):
@@ -177,7 +191,66 @@ def cluster_persons_with_gemma(image_pil, regions):
 
 
 def visualize_persons(image_pil, regions, persons):
-    raise NotImplementedError("T5 will implement this")
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    # Build region_index -> (person_id, color) map
+    index_to_person = {}
+    for person in persons:
+        try:
+            pid = int(person.get("person_id", -1))
+        except (TypeError, ValueError):
+            pid = -1
+        color = PERSON_COLORS[pid % len(PERSON_COLORS)] if pid >= 0 else (128, 128, 128)
+        for ri in person.get("region_indexes", []):
+            try:
+                ri_int = int(ri)
+            except (TypeError, ValueError):
+                continue
+            index_to_person[ri_int] = (pid, color)
+
+    base = image_pil.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+
+    # Paint masks
+    for region in regions:
+        ri = region.get("region_index", -1)
+        pid, color = index_to_person.get(ri, (None, (128, 128, 128)))
+        mask = region.get("mask")
+        if mask is None:
+            continue
+        mask_arr = np.asarray(mask).astype(np.uint8)
+        if mask_arr.ndim == 3:
+            mask_arr = mask_arr.squeeze()
+        if mask_arr.shape[:2] != (base.size[1], base.size[0]):
+            mpil = Image.fromarray((mask_arr * 255).astype(np.uint8)).resize(base.size, Image.NEAREST)
+        else:
+            mpil = Image.fromarray((mask_arr * 255).astype(np.uint8))
+        fill = Image.new("RGBA", base.size, color + (0,))
+        alpha = mpil.point(lambda v: int(0.45 * 255) if v > 0 else 0)
+        fill.putalpha(alpha)
+        overlay = Image.alpha_composite(overlay, fill)
+
+    composed = Image.alpha_composite(base, overlay).convert("RGB")
+
+    # Draw bboxes + labels
+    draw = ImageDraw.Draw(composed)
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
+    for region in regions:
+        ri = region.get("region_index", -1)
+        pid, color = index_to_person.get(ri, (None, (128, 128, 128)))
+        x1, y1, x2, y2 = region["bbox"]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        label = f"P{pid}/{region['prompt']}" if pid is not None else f"?/{region['prompt']}"
+        tb = draw.textbbox((x1, max(0, y1 - 22)), label, font=font)
+        draw.rectangle(tb, fill=color)
+        draw.text((tb[0], tb[1]), label, fill="black" if sum(color) > 400 else "white", font=font)
+
+    return composed
 
 
 def process_image(image_path, out_dir, conf_thresh, sam_model, sam_processor, vl_model, vl_processor, device):
