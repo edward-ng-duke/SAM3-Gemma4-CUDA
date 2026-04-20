@@ -2,6 +2,14 @@ import argparse
 import json
 import os
 from pathlib import Path
+from urllib.parse import quote as url_quote
+
+
+def _url_path(rel_path):
+    if not rel_path:
+        return ""
+    parts = rel_path.replace(os.sep, "/").split("/")
+    return "/".join(url_quote(p, safe="") for p in parts)
 
 
 def load_all_jsons(out_dir):
@@ -105,10 +113,14 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
 .badge-gemma.count-bucket-ge4 { background: #8e44ad; }
 .badge-gemma.count-bucket-err { background: #c0392b; }
 .card .body { padding-top: 12px; border-top: 1px solid #eee; margin-top: 10px; }
-.images { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
-.images figure { margin: 0; }
-.images figcaption { font-size: 0.8rem; color: #666; margin-bottom: 4px; }
-.images img { width: 100%; border-radius: 6px; border: 1px solid #ddd; }
+.tabs { display: flex; gap: 0; margin-bottom: 12px; border-bottom: 2px solid #e5e5e5; }
+.tab { background: none; border: none; padding: 8px 18px; cursor: pointer; font-size: 0.95rem; border-bottom: 3px solid transparent; margin-bottom: -2px; font-weight: 600; color: #666; transition: color 0.1s; }
+.tab:hover { color: #4682B4; }
+.tab.active { color: #4682B4; border-bottom-color: #4682B4; }
+.views .view { display: none; margin: 0; }
+.views .view.active { display: block; }
+.views figcaption { font-size: 0.85rem; color: #666; margin-bottom: 4px; }
+.views img { width: 100%; max-height: 85vh; object-fit: contain; border-radius: 6px; border: 1px solid #ddd; background: #fafafa; }
 .reasoning { background: #fafafa; border-left: 3px solid #4682B4; padding: 8px 12px; margin: 10px 0; font-size: 0.92rem; line-height: 1.5; white-space: pre-wrap; }
 .per-prompt { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin: 10px 0; }
 .per-prompt th, .per-prompt td { border: 1px solid #ddd; padding: 4px 6px; text-align: center; }
@@ -217,8 +229,9 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
         status_attr = html_escape(status, quote=True)
         name_attr = html_escape(name_lower, quote=True)
         count_attr = html_escape(str(num_persons), quote=True)
-        rel_sam_attr = html_escape(rel_sam, quote=True)
-        rel_gemma_attr = html_escape(rel_gemma, quote=True)
+        rel_image_attr = html_escape(_url_path(rel_image), quote=True)
+        rel_sam_attr = html_escape(_url_path(rel_sam), quote=True)
+        rel_gemma_attr = html_escape(_url_path(rel_gemma), quote=True)
 
         parts_html.append(
             f'    <details open class="card status-{html_escape(status, quote=True)} count-bucket-{bucket}" '
@@ -243,13 +256,21 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
         parts_html.append('      <div class="body">')
 
         if status == "ok":
-            # Side-by-side: SAM raw | Gemma grouped
-            parts_html.append('        <div class="images">')
+            # Tabs: Original | SAM | Gemma
+            parts_html.append('        <div class="tabs">')
+            parts_html.append('          <button class="tab active" data-tab="orig">原图</button>')
+            parts_html.append('          <button class="tab" data-tab="sam">SAM</button>')
+            parts_html.append('          <button class="tab" data-tab="gemma">Gemma</button>')
+            parts_html.append("        </div>")
+            parts_html.append('        <div class="views">')
             parts_html.append(
-                f'          <figure><figcaption>SAM raw (by prompt)</figcaption><img src="{rel_sam_attr}" loading="lazy"></figure>'
+                f'          <figure class="view view-orig active"><figcaption>原图</figcaption><img src="{rel_image_attr}" loading="lazy"></figure>'
             )
             parts_html.append(
-                f'          <figure><figcaption>Gemma grouped (by person)</figcaption><img src="{rel_gemma_attr}" loading="lazy"></figure>'
+                f'          <figure class="view view-sam"><figcaption>SAM raw — colored by prompt (person=red, face=orange, head=yellow, hands=green, arm=teal, shoulder=blue, torso=indigo, legs=purple, feet=pink)</figcaption><img src="{rel_sam_attr}" loading="lazy"></figure>'
+            )
+            parts_html.append(
+                f'          <figure class="view view-gemma"><figcaption>Gemma grouped — one color per detected person</figcaption><img src="{rel_gemma_attr}" loading="lazy"></figure>'
             )
             parts_html.append("        </div>")
 
@@ -358,6 +379,21 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
   sortSel.addEventListener('change', apply);
   filterSel.addEventListener('change', apply);
   apply();
+
+  // Per-card tab switching: click a .tab to show the matching .view
+  document.querySelectorAll('.card .tabs').forEach(function (tabs) {
+    tabs.addEventListener('click', function (e) {
+      if (!e.target.matches('.tab')) return;
+      var which = e.target.dataset.tab;
+      var card = tabs.closest('.card');
+      card.querySelectorAll('.tab').forEach(function (t) {
+        t.classList.toggle('active', t === e.target);
+      });
+      card.querySelectorAll('.view').forEach(function (v) {
+        v.classList.toggle('active', v.classList.contains('view-' + which));
+      });
+    });
+  });
 })();
   </script>""")
     parts_html.append("</body>")
