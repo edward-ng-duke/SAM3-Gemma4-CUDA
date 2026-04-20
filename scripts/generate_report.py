@@ -112,6 +112,7 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
 .badge-gemma.count-bucket-3 { background: #e67e22; }
 .badge-gemma.count-bucket-ge4 { background: #8e44ad; }
 .badge-gemma.count-bucket-err { background: #c0392b; }
+.badge-gemma.count-bucket-parseerr { background: #d63384; }
 .card .body { padding-top: 12px; border-top: 1px solid #eee; margin-top: 10px; }
 .tabs { display: flex; gap: 0; margin-bottom: 12px; border-bottom: 2px solid #e5e5e5; }
 .tab { background: none; border: none; padding: 8px 18px; cursor: pointer; font-size: 0.95rem; border-bottom: 3px solid transparent; margin-bottom: -2px; font-weight: 600; color: #666; transition: color 0.1s; }
@@ -168,6 +169,7 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
     parts_html.append('      <option value="ge1">Persons ≥ 1</option>')
     parts_html.append('      <option value="ge2">Persons ≥ 2</option>')
     parts_html.append('      <option value="ge3">Persons ≥ 3</option>')
+    parts_html.append('      <option value="parseerr">Gemma parse_error</option>')
     parts_html.append("    </select>")
     parts_html.append("  </div>")
     parts_html.append("")
@@ -204,6 +206,8 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
         # Badge text
         if status == "error":
             badge_text = "ERROR"
+        elif num_persons < 0:
+            badge_text = "?"
         elif status == "ok" and num_persons == 0:
             badge_text = "0"
         elif status == "ok":
@@ -214,6 +218,8 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
         # Count bucket
         if status == "error":
             bucket = "err"
+        elif num_persons < 0:
+            bucket = "parseerr"
         elif num_persons == 0:
             bucket = "0"
         elif num_persons == 1:
@@ -353,6 +359,7 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
     if (f === 'ge1' && !(count >= 1)) return false;
     if (f === 'ge2' && !(count >= 2)) return false;
     if (f === 'ge3' && !(count >= 3)) return false;
+    if (f === 'parseerr' && !(count < 0 && status === 'ok')) return false;
     return true;
   }
 
