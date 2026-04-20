@@ -83,13 +83,11 @@ def write_summary(items, out_dir):
     return summary
 
 
-def render_html(items, out_dir, images_rel=None):
+def render_html(items, out_dir):
     from html import escape as html_escape
     from datetime import datetime
 
     os.makedirs(out_dir, exist_ok=True)
-    if images_rel is None:
-        images_rel = f"../../{os.path.basename(os.path.normpath(out_dir))}"
 
     css = """
 * { box-sizing: border-box; }
@@ -183,9 +181,16 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
             num_persons = 0
 
         image_name = item.get("image") or ""
+        image_path = item.get("image_path") or ""
         name_lower = image_name.lower() if isinstance(image_name, str) else ""
 
-        rel_image = f"{images_rel}/{image_name}" if image_name else ""
+        if image_path:
+            try:
+                rel_image = os.path.relpath(image_path, out_dir)
+            except Exception:
+                rel_image = ""
+        else:
+            rel_image = ""
 
         stem = Path(image_name).stem if image_name else ""
         rel_sam = f"visualizations/{stem}_sam.png" if stem else ""
@@ -407,9 +412,6 @@ def main():
     parser = argparse.ArgumentParser(description="Generate HTML report from batch detection JSONs.")
     parser.add_argument("--output-dir", type=str, required=True,
                         help="Directory containing json/ subdirectory (same as batch_detect_persons --output-dir)")
-    parser.add_argument("--images-rel", type=str, default=None,
-                        help="Relative path from report.html to the original images dir "
-                             "(default: ../../<basename-of-output-dir>)")
     args = parser.parse_args()
     abs_out_dir = os.path.abspath(args.output_dir)
     items = load_all_jsons(abs_out_dir)
@@ -417,7 +419,7 @@ def main():
         print(f"No JSONs found in {abs_out_dir}/json/")
         return
     write_summary(items, abs_out_dir)
-    render_html(items, abs_out_dir, images_rel=args.images_rel)
+    render_html(items, abs_out_dir)
     print(f"Wrote {abs_out_dir}/summary.json")
     print(f"Wrote {abs_out_dir}/report.html")
 
