@@ -75,7 +75,105 @@ def collect_all_detections(image_pil, prompts, conf_thresh, sam_model, sam_proce
 
 
 def cluster_persons_with_gemma(image_pil, regions):
-    raise NotImplementedError("T4 will implement this")
+    if len(regions) == 0:
+        return {"num_persons": 0, "reasoning": "no regions to cluster", "persons": []}
+
+    import torch
+    from app import VL_MODEL, VL_PROCESSOR, build_vl_inputs, safe_parse_json
+
+    regions_for_prompt = [{k: v for k, v in r.items() if k != "mask"} for r in regions]
+    regions_json = json.dumps(regions_for_prompt, indent=2)
+
+    instruction = (
+        "You are given an image and a list of detected regions. Each region was produced by a\n"
+        "segmentation model prompted with a body-part keyword (person, face, head, hands, arm,\n"
+        "shoulder, torso, legs, feet). Multiple regions may correspond to the same physical\n"
+        "person, and some regions may be false positives.\n"
+        "\n"
+        "Detected regions:\n"
+        f"{regions_json}\n"
+        "\n"
+        "Task: Count how many DISTINCT PHYSICAL PERSONS are visible in the image, and group\n"
+        "the regions by person.\n"
+        "\n"
+        "Rules:\n"
+        "- Two regions belong to the same person if spatially consistent with one body.\n"
+        "- Clear false positives should NOT be assigned to any person.\n"
+        "- A person counts even if only partially visible (only a hand, only a leg, only a\n"
+        "  shoulder — still counts as 1 person).\n"
+        "- If no persons are visible, return num_persons: 0 and empty persons list.\n"
+        "\n"
+        "Return ONLY valid JSON (no markdown fences):\n"
+        "{\"num_persons\": <int>, \"reasoning\": \"<1-3 sentences in Chinese>\",\n"
+        " \"persons\": [{\"person_id\": <int>, \"region_indexes\": [<int>, ...]}]}"
+    )
+
+    inputs = build_vl_inputs(image_pil, instruction)
+    with torch.inference_mode():
+        gen_ids = VL_MODEL.generate(
+            **inputs,
+            max_new_tokens=768,
+            use_cache=True,
+            temperature=0.2,
+            do_sample=False,
+        )
+    raw = VL_PROCESSOR.batch_decode(
+        gen_ids[:, inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )[0].strip()
+
+    try:
+        parsed = safe_parse_json(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("parsed output is not a dict")
+
+        try:
+            num_persons = int(parsed.get("num_persons", -1))
+        except (TypeError, ValueError):
+            num_persons = -1
+
+        reasoning_val = parsed.get("reasoning", "")
+        if isinstance(reasoning_val, str):
+            reasoning = reasoning_val
+        else:
+            try:
+                reasoning = str(reasoning_val)
+            except Exception:
+                reasoning = ""
+
+        persons_raw = parsed.get("persons", [])
+        if not isinstance(persons_raw, list):
+            persons_raw = []
+
+        n_regions = len(regions)
+        persons = []
+        for p in persons_raw:
+            if not isinstance(p, dict):
+                continue
+            try:
+                pid = int(p.get("person_id", -1))
+            except (TypeError, ValueError):
+                continue
+            ridx_raw = p.get("region_indexes", [])
+            if not isinstance(ridx_raw, list):
+                ridx_raw = []
+            region_indexes = []
+            for idx in ridx_raw:
+                try:
+                    idx_int = int(idx)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx_int < n_regions:
+                    region_indexes.append(idx_int)
+            persons.append({"person_id": pid, "region_indexes": region_indexes})
+
+        return {"num_persons": num_persons, "reasoning": reasoning, "persons": persons}
+    except Exception:
+        return {
+            "num_persons": -1,
+            "reasoning": f"parse_error: {raw[:120]}",
+            "persons": [],
+        }
 
 
 def visualize_persons(image_pil, regions, persons):
