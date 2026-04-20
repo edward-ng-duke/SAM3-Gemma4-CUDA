@@ -301,6 +301,54 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
         parts_html.append("    </details>")
 
     parts_html.append("  </main>")
+    parts_html.append("""  <script>
+(function () {
+  const grid = document.getElementById('grid');
+  const search = document.getElementById('search');
+  const sortSel = document.getElementById('sort');
+  const filterSel = document.getElementById('filter');
+
+  function getCards() {
+    return Array.from(grid.querySelectorAll('.card'));
+  }
+
+  function passes(card, q, f) {
+    const name = card.dataset.name || '';
+    const count = parseInt(card.dataset.count, 10);
+    const status = card.dataset.status;
+    if (q && !name.includes(q)) return false;
+    if (f === 'ok' && status !== 'ok') return false;
+    if (f === 'error' && status !== 'error') return false;
+    if (f === 'ge1' && !(count >= 1)) return false;
+    if (f === 'ge2' && !(count >= 2)) return false;
+    if (f === 'ge3' && !(count >= 3)) return false;
+    return true;
+  }
+
+  function apply() {
+    const q = (search.value || '').trim().toLowerCase();
+    const f = filterSel.value;
+    const s = sortSel.value;
+    const cards = getCards();
+    cards.forEach(c => { c.hidden = !passes(c, q, f); });
+    const visible = cards.filter(c => !c.hidden);
+    const cmp = {
+      'name-asc': (a, b) => (a.dataset.name || '').localeCompare(b.dataset.name || ''),
+      'count-desc': (a, b) => parseInt(b.dataset.count, 10) - parseInt(a.dataset.count, 10) || (a.dataset.name || '').localeCompare(b.dataset.name || ''),
+      'count-asc': (a, b) => parseInt(a.dataset.count, 10) - parseInt(b.dataset.count, 10) || (a.dataset.name || '').localeCompare(b.dataset.name || ''),
+    }[s];
+    if (cmp) {
+      visible.sort(cmp);
+      visible.forEach(c => grid.appendChild(c));
+    }
+  }
+
+  search.addEventListener('input', apply);
+  sortSel.addEventListener('change', apply);
+  filterSel.addEventListener('change', apply);
+  apply();
+})();
+  </script>""")
     parts_html.append("</body>")
     parts_html.append("</html>")
 
