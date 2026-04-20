@@ -363,7 +363,63 @@ def main():
     )
     args = parser.parse_args()
 
-    raise NotImplementedError("T7 will wire this up")
+    input_dir = os.path.abspath(args.input_dir)
+    output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(os.path.join(output_dir, "json"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "visualizations"), exist_ok=True)
+
+    entries = []
+    for name in os.listdir(input_dir):
+        ext = os.path.splitext(name)[1].lower()
+        if ext in IMAGE_EXTS:
+            full = os.path.join(input_dir, name)
+            if os.path.isfile(full):
+                entries.append(full)
+    entries.sort()
+
+    if len(entries) == 0:
+        print(f"No images in {input_dir} (looked for {IMAGE_EXTS})")
+        return
+
+    from app import SAM_MODEL, SAM_PROCESSOR, VL_MODEL, VL_PROCESSOR, DEVICE
+    print("Models loaded.")
+
+    N = len(entries)
+    ok_count = 0
+    err_count = 0
+    skip_count = 0
+
+    for i, path in enumerate(entries, start=1):
+        basename = os.path.basename(path)
+        stem = Path(path).stem
+        json_path = os.path.join(output_dir, "json", f"{stem}.json")
+
+        if os.path.exists(json_path) and not args.force:
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if existing.get("status") == "ok":
+                    print(f"[{i}/{N}] {basename} | SKIP (existing ok)")
+                    skip_count += 1
+                    continue
+            except Exception:
+                pass
+
+        t0 = time.time()
+        result = process_image(
+            path, output_dir, args.conf_thresh,
+            SAM_MODEL, SAM_PROCESSOR, VL_MODEL, VL_PROCESSOR, DEVICE,
+        )
+        elapsed = time.time() - t0
+
+        if result.get("status") == "ok":
+            print(f"[{i}/{N}] {basename} | persons={result['num_persons']} | {elapsed:.1f}s")
+            ok_count += 1
+        else:
+            print(f"[{i}/{N}] {basename} | ERROR: {result.get('error_message','?')} | {elapsed:.1f}s")
+            err_count += 1
+
+    print(f"Done. processed={ok_count} errors={err_count} skipped={skip_count} out={output_dir}")
 
 
 if __name__ == "__main__":
