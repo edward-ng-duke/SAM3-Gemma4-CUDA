@@ -63,7 +63,15 @@ def detect_with_prompt(image_pil, prompt, conf_thresh, sam_model, sam_processor,
 
 
 def collect_all_detections(image_pil, prompts, conf_thresh, sam_model, sam_processor, device):
-    raise NotImplementedError("T3 will implement this")
+    regions = []
+    per_prompt_counts = {}
+    for prompt in prompts:
+        got = detect_with_prompt(image_pil, prompt, conf_thresh, sam_model, sam_processor, device)
+        per_prompt_counts[prompt] = len(got)
+        regions.extend(got)
+    for i, region in enumerate(regions):
+        region["region_index"] = i
+    return regions, per_prompt_counts
 
 
 def cluster_persons_with_gemma(image_pil, regions):
