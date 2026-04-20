@@ -367,7 +367,15 @@ def main():
     parser.add_argument("--output-dir", type=str, required=True,
                         help="Directory containing json/ subdirectory (same as batch_detect_persons --output-dir)")
     args = parser.parse_args()
-    raise NotImplementedError("T13 will wire this up")
+    abs_out_dir = os.path.abspath(args.output_dir)
+    items = load_all_jsons(abs_out_dir)
+    if items == []:
+        print(f"No JSONs found in {abs_out_dir}/json/")
+        return
+    write_summary(items, abs_out_dir)
+    render_html(items, abs_out_dir)
+    print(f"Wrote {abs_out_dir}/summary.json")
+    print(f"Wrote {abs_out_dir}/report.html")
 
 
 if __name__ == "__main__":
