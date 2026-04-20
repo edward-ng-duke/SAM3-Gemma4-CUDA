@@ -27,6 +27,23 @@ PERSON_COLORS = [
     (52, 152, 219),   # sky blue
 ]
 
+PROMPT_COLORS = {
+    "person":   (255,  59,  48),
+    "face":     (255, 149,   0),
+    "head":     (255, 204,   0),
+    "hands":    ( 52, 199,  89),
+    "arm":      ( 48, 176, 199),
+    "shoulder": ( 10, 132, 255),
+    "torso":    ( 88,  86, 214),
+    "legs":     (175,  82, 222),
+    "feet":     (255,  45,  85),
+}
+
+OVERLAY_OUTLINE_WIDTH = 6
+OVERLAY_MASK_ALPHA = int(0.55 * 255)
+OVERLAY_FONT_SIZE = 20
+OVERLAY_LABEL_OFFSET = 28
+
 
 def _clamp_box_xyxy(box, width, height):
     x1, y1, x2, y2 = box
@@ -229,7 +246,7 @@ def visualize_persons(image_pil, regions, persons):
         else:
             mpil = Image.fromarray((mask_arr * 255).astype(np.uint8))
         fill = Image.new("RGBA", base.size, color + (0,))
-        alpha = mpil.point(lambda v: int(0.45 * 255) if v > 0 else 0)
+        alpha = mpil.point(lambda v: OVERLAY_MASK_ALPHA if v > 0 else 0)
         fill.putalpha(alpha)
         overlay = Image.alpha_composite(overlay, fill)
 
@@ -238,7 +255,7 @@ def visualize_persons(image_pil, regions, persons):
     # Draw bboxes + labels
     draw = ImageDraw.Draw(composed)
     try:
-        font = ImageFont.truetype("arial.ttf", 16)
+        font = ImageFont.truetype("arial.ttf", OVERLAY_FONT_SIZE)
     except Exception:
         font = ImageFont.load_default()
 
@@ -246,9 +263,56 @@ def visualize_persons(image_pil, regions, persons):
         ri = region.get("region_index", -1)
         pid, color = index_to_person.get(ri, (None, (128, 128, 128)))
         x1, y1, x2, y2 = region["bbox"]
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-        label = f"P{pid}/{region['prompt']}" if pid is not None else f"?/{region['prompt']}"
-        tb = draw.textbbox((x1, max(0, y1 - 22)), label, font=font)
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=OVERLAY_OUTLINE_WIDTH)
+        label = f"P{pid}/{region['prompt']}" if pid is not None and pid >= 0 else f"?/{region['prompt']}"
+        tb = draw.textbbox((x1, max(0, y1 - OVERLAY_LABEL_OFFSET)), label, font=font)
+        draw.rectangle(tb, fill=color)
+        draw.text((tb[0], tb[1]), label, fill="black" if sum(color) > 400 else "white", font=font)
+
+    return composed
+
+
+def visualize_sam_raw(image_pil, regions):
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    base = image_pil.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+
+    for region in regions:
+        prompt = region.get("prompt", "")
+        color = PROMPT_COLORS.get(prompt, (200, 200, 200))
+        mask = region.get("mask")
+        if mask is None:
+            continue
+        mask_arr = np.asarray(mask).astype(np.uint8)
+        if mask_arr.ndim == 3:
+            mask_arr = mask_arr.squeeze()
+        if mask_arr.shape[:2] != (base.size[1], base.size[0]):
+            mpil = Image.fromarray((mask_arr * 255).astype(np.uint8)).resize(base.size, Image.NEAREST)
+        else:
+            mpil = Image.fromarray((mask_arr * 255).astype(np.uint8))
+        fill = Image.new("RGBA", base.size, color + (0,))
+        alpha = mpil.point(lambda v: OVERLAY_MASK_ALPHA if v > 0 else 0)
+        fill.putalpha(alpha)
+        overlay = Image.alpha_composite(overlay, fill)
+
+    composed = Image.alpha_composite(base, overlay).convert("RGB")
+
+    draw = ImageDraw.Draw(composed)
+    try:
+        font = ImageFont.truetype("arial.ttf", OVERLAY_FONT_SIZE)
+    except Exception:
+        font = ImageFont.load_default()
+
+    for region in regions:
+        prompt = region.get("prompt", "")
+        color = PROMPT_COLORS.get(prompt, (200, 200, 200))
+        x1, y1, x2, y2 = region["bbox"]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=OVERLAY_OUTLINE_WIDTH)
+        score = region.get("score", 0.0)
+        label = f"{prompt} {float(score):.2f}"
+        tb = draw.textbbox((x1, max(0, y1 - OVERLAY_LABEL_OFFSET)), label, font=font)
         draw.rectangle(tb, fill=color)
         draw.text((tb[0], tb[1]), label, fill="black" if sum(color) > 400 else "white", font=font)
 
@@ -283,11 +347,17 @@ def process_image(image_path, out_dir, conf_thresh, sam_model, sam_processor, vl
         for person in result["persons"]:
             person["parts"] = [regions[ri]["prompt"] for ri in person["region_indexes"]]
 
-        overlay_img = visualize_persons(image_pil, regions, result["persons"])
-        overlay_path = os.path.join(vis_dir, f"{stem}_overlay.png")
-        tmp_png = overlay_path + ".tmp"
-        overlay_img.save(tmp_png, format="PNG")
-        os.replace(tmp_png, overlay_path)
+        sam_img = visualize_sam_raw(image_pil, regions)
+        sam_path = os.path.join(vis_dir, f"{stem}_sam.png")
+        tmp_sam = sam_path + ".tmp"
+        sam_img.save(tmp_sam, format="PNG")
+        os.replace(tmp_sam, sam_path)
+
+        gemma_img = visualize_persons(image_pil, regions, result["persons"])
+        gemma_path = os.path.join(vis_dir, f"{stem}_gemma.png")
+        tmp_gemma = gemma_path + ".tmp"
+        gemma_img.save(tmp_gemma, format="PNG")
+        os.replace(tmp_gemma, gemma_path)
 
         detections = [{k: v for k, v in r.items() if k != "mask"} for r in regions]
 
