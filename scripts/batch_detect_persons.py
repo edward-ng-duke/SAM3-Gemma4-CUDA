@@ -254,7 +254,84 @@ def visualize_persons(image_pil, regions, persons):
 
 
 def process_image(image_path, out_dir, conf_thresh, sam_model, sam_processor, vl_model, vl_processor, device):
-    raise NotImplementedError("T6 will implement this")
+    from PIL import Image
+
+    json_dir = os.path.join(out_dir, "json")
+    vis_dir = os.path.join(out_dir, "visualizations")
+    os.makedirs(json_dir, exist_ok=True)
+    os.makedirs(vis_dir, exist_ok=True)
+
+    stem = Path(image_path).stem
+    basename = os.path.basename(image_path)
+    json_path = os.path.join(json_dir, f"{stem}.json")
+
+    try:
+        abs_path = os.path.abspath(image_path)
+        image_pil = Image.open(image_path).convert("RGB")
+
+        regions, per_prompt_counts = collect_all_detections(
+            image_pil, PROMPTS, conf_thresh, sam_model, sam_processor, device
+        )
+
+        if len(regions) == 0:
+            result = {"num_persons": 0, "reasoning": "", "persons": []}
+        else:
+            result = cluster_persons_with_gemma(image_pil, regions)
+
+        for person in result["persons"]:
+            person["parts"] = [regions[ri]["prompt"] for ri in person["region_indexes"]]
+
+        overlay_img = visualize_persons(image_pil, regions, result["persons"])
+        overlay_path = os.path.join(vis_dir, f"{stem}_overlay.png")
+        tmp_png = overlay_path + ".tmp"
+        overlay_img.save(tmp_png, format="PNG")
+        os.replace(tmp_png, overlay_path)
+
+        detections = [{k: v for k, v in r.items() if k != "mask"} for r in regions]
+
+        record = {
+            "image": basename,
+            "image_path": abs_path,
+            "image_size": [image_pil.size[0], image_pil.size[1]],
+            "status": "ok",
+            "error_message": None,
+            "conf_thresh": conf_thresh,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "num_persons": result["num_persons"],
+            "reasoning": result["reasoning"],
+            "detections": detections,
+            "per_prompt_counts": per_prompt_counts,
+            "persons": result["persons"],
+        }
+
+        tmp = json_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, json_path)
+
+        return record
+
+    except Exception as e:
+        try:
+            abs_path = os.path.abspath(image_path)
+        except Exception:
+            abs_path = ""
+        record = {
+            "image": basename,
+            "image_path": abs_path,
+            "status": "error",
+            "error_message": f"{type(e).__name__}: {e}",
+            "num_persons": -1,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            tmp = json_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, json_path)
+        except Exception:
+            pass
+        return record
 
 
 def main():
