@@ -12,8 +12,54 @@ DEFAULT_CONF_THRESH = 0.45
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
+def _clamp_box_xyxy(box, width, height):
+    x1, y1, x2, y2 = box
+    x1 = max(0, min(width - 1, int(x1)))
+    y1 = max(0, min(height - 1, int(y1)))
+    x2 = max(0, min(width - 1, int(x2)))
+    y2 = max(0, min(height - 1, int(y2)))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return [x1, y1, x2, y2]
+
+
 def detect_with_prompt(image_pil, prompt, conf_thresh, sam_model, sam_processor, device):
-    raise NotImplementedError("T2 will implement this")
+    import torch
+    import numpy as np
+
+    model_inputs = sam_processor(images=image_pil, text=prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        sam_outputs = sam_model(**model_inputs)
+    processed = sam_processor.post_process_instance_segmentation(
+        sam_outputs,
+        threshold=float(conf_thresh),
+        mask_threshold=0.5,
+        target_sizes=model_inputs.get("original_sizes").tolist(),
+    )[0]
+    raw_masks = processed.get("masks", None)
+    raw_scores = processed.get("scores", None)
+    if raw_masks is None or raw_scores is None or len(raw_scores) == 0:
+        return []
+    raw_masks_np = raw_masks.detach().cpu().numpy()
+    raw_scores_np = raw_scores.detach().cpu().numpy()
+    w, h = image_pil.size[0], image_pil.size[1]
+    out = []
+    for idx, mask in enumerate(raw_masks_np):
+        if mask.ndim == 3:
+            mask = np.squeeze(mask, axis=0)
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            continue
+        bbox = _clamp_box_xyxy([xs.min(), ys.min(), xs.max(), ys.max()], w, h)
+        out.append({
+            "prompt": prompt,
+            "bbox": bbox,
+            "score": float(raw_scores_np[idx]),
+            "mask": mask,
+        })
+    return out
 
 
 def collect_all_detections(image_pil, prompts, conf_thresh, sam_model, sam_processor, device):
