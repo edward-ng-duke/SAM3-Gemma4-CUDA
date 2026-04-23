@@ -60,78 +60,41 @@ def person_distribution(items):
 def render_doc(datasets, out_path):
     """datasets = [(label, items, rows), ...]"""
     lines = []
-    lines.append("# 人数统计（SAM3-only，单人 / 多人）")
+    lines.append("# 人数统计（SAM3）")
     lines.append("")
-    lines.append("## 算法")
+    lines.append("**规则：** SAM `person` prompt 返回 ≥ 2 个区域 → 多人，否则 单人。")
     lines.append("")
-    lines.append("**多人** ⇐ SAM 的 `person` prompt 返回 **≥ 2** 个区域；否则 **单人**。")
+
+    lines.append("## 汇总")
     lines.append("")
-    lines.append("### 为什么是这条规则？")
-    lines.append("")
-    lines.append("在两批数据上实测了 5 条候选规则，结果如下（目标：正向多人数尽量低、反向多人数尽量高）：")
-    lines.append("")
-    lines.append("| 规则 | 正向多人 | 反向多人 |")
-    lines.append("|------|----------|----------|")
-    lines.append("| **A) `person ≥ 2`（当选）** | **17 / 107 (15%)** | **81 / 107 (75%)** |")
-    lines.append("| B) `person ≥ 2` 或 `face ≥ 2` | 19 / 107 | 81 / 107 |")
-    lines.append("| C) `person ≥ 2` 或 `face ≥ 2` 或 `head ≥ 2` | 19 / 107 | 82 / 107 |")
-    lines.append("| D) 任一独占部位 ≥ 2（person/face/head/torso） | 19 / 107 | 82 / 107 |")
-    lines.append("| E) 独占 ≥ 2 或 成对部位 ≥ 3（hands/arm/legs/feet/shoulder） | 21 / 107 | 84 / 107 |")
-    lines.append("")
-    lines.append("- 加入 `face / head ≥ 2` 只在反向多捞 0–1 张，却在正向多误报 2 张 —— 收益 < 成本")
-    lines.append("- 加入成对部位阈值（规则 E，旧版用的）给反向再多 2 张，代价是正向再误报 2 张 —— SAM 经常把单人的一只手过分割成两块 mask，`hands = 3` 常见但不意味多人")
-    lines.append("- **规则 A 最干净**：物理含义清晰（SAM 看到 ≥2 个 person 实例），没有任何启发式阈值，可解释、不过拟合")
-    lines.append("")
-    lines.append("## 总表")
-    lines.append("")
-    lines.append("| 数据集 | 总图数 | 单人 | 多人 | 多人占比 |")
-    lines.append("|--------|--------|------|------|----------|")
+    lines.append("| 数据集 | 总图数 | 单人 | 多人 | 单人占比 | 多人占比 |")
+    lines.append("|--------|-------:|-----:|-----:|---------:|---------:|")
     for label, items, rows in datasets:
         total = len(items)
         single = sum(1 for r in rows if r[1] == "single")
         multi = sum(1 for r in rows if r[1] == "multi")
-        pct = f"{multi * 100 / total:.1f}%" if total else "-"
-        lines.append(f"| {label} | {total} | {single} | **{multi}** | {pct} |")
+        s_pct = f"{single * 100 / total:.1f}%" if total else "-"
+        m_pct = f"{multi * 100 / total:.1f}%" if total else "-"
+        lines.append(f"| {label} | {total} | {single} | {multi} | {s_pct} | **{m_pct}** |")
     lines.append("")
 
-    lines.append("## SAM `person` prompt 的完整分布")
-    lines.append("")
-    lines.append("直观看每批图里 SAM 找到多少个 person 实例，便于核对阈值合理性。")
+    lines.append("## SAM `person` 数分布")
     lines.append("")
     for label, items, rows in datasets:
         dist = person_distribution(items)
-        lines.append(f"### {label}")
+        total = sum(dist.values())
+        lines.append(f"### {label}（共 {total} 张）")
         lines.append("")
-        lines.append("| SAM `person` 数 | 张数 | 分类 |")
-        lines.append("|-----------------|------|------|")
+        lines.append("| person 数 | 张数 | 占比 | 分类 |")
+        lines.append("|----------:|-----:|-----:|------|")
         for k in sorted(dist.keys()):
             v = dist[k]
+            pct = f"{v * 100 / total:.1f}%"
             cls = "多人" if k >= 2 else "单人"
-            lines.append(f"| {k} | {v} | {cls} |")
+            lines.append(f"| {k} | {v} | {pct} | {cls} |")
         lines.append("")
 
-    lines.append("## 抽查：被分到「多人」的样本（最多 15 条）")
-    lines.append("")
-    lines.append("如果你手工核对发现某张图实际是单人，说明 SAM 在那张图上把一个人的不同部位错误切成了多个 person blob。目前实测这种情况很少，但欢迎反馈具体样本。")
-    lines.append("")
-    for label, items, rows in datasets:
-        lines.append(f"### {label}")
-        lines.append("")
-        lines.append("| 图 | SAM `person` |")
-        lines.append("|----|--------------|")
-        multis = [(r, it) for (r, it) in zip(rows, items) if r[1] == "multi"]
-        for (row, it) in multis[:15]:
-            name = row[0]
-            short = name if len(name) <= 50 else name[:47] + "…"
-            ppc = it.get("per_prompt_counts") or {}
-            lines.append(f"| `{short}` | {ppc.get('person', 0)} |")
-        if len(multis) > 15:
-            lines.append(f"| … | 还有 {len(multis)-15} 张 |")
-        if not multis:
-            lines.append("| — | 无 |")
-        lines.append("")
-
-    lines.append("## 重跑命令")
+    lines.append("## 重跑")
     lines.append("")
     lines.append("```bash")
     lines.append("python scripts/classify_persons.py \\")
@@ -139,8 +102,6 @@ def render_doc(datasets, out_path):
     lines.append('  --label 反向 --json-dir "/home/edward/research/lianzhong-project/data/outputs/反向教学教材/json" \\')
     lines.append('  --out "/home/edward/research/lianzhong-project/data/outputs/人数统计.md"')
     lines.append("```")
-    lines.append("")
-    lines.append("脚本在 `scripts/classify_persons.py`。分类函数 `classify(item) -> (verdict, reason)` 可 import。")
     lines.append("")
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
