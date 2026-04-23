@@ -171,6 +171,13 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
     parts_html.append('      <option value="ge3">Persons ≥ 3</option>')
     parts_html.append('      <option value="parseerr">Gemma parse_error</option>')
     parts_html.append("    </select>")
+    parts_html.append('    <select id="filter-count" title="按 SAM person 数精确过滤">')
+    parts_html.append('      <option value="all">所有人数</option>')
+    parts_html.append('      <option value="eq0">人数 = 0</option>')
+    parts_html.append('      <option value="eq1">人数 = 1</option>')
+    parts_html.append('      <option value="eq2">人数 = 2</option>')
+    parts_html.append('      <option value="ge3">人数 ≥ 3</option>')
+    parts_html.append("    </select>")
     parts_html.append("  </div>")
     parts_html.append("")
     parts_html.append('  <main id="grid">')
@@ -238,9 +245,11 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
         rel_sam_attr = html_escape(_url_path(rel_sam), quote=True)
         rel_gemma_attr = html_escape(_url_path(rel_gemma), quote=True)
 
+        sam_count_attr = html_escape(str(sam_person_count), quote=True)
         parts_html.append(
             f'    <details open class="card status-{html_escape(status, quote=True)} count-bucket-{bucket}" '
-            f'data-count="{count_attr}" data-status="{status_attr}" data-name="{name_attr}">'
+            f'data-count="{count_attr}" data-sam-count="{sam_count_attr}" '
+            f'data-status="{status_attr}" data-name="{name_attr}">'
         )
         parts_html.append("      <summary>")
         parts_html.append(
@@ -344,14 +353,16 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
   const search = document.getElementById('search');
   const sortSel = document.getElementById('sort');
   const filterSel = document.getElementById('filter');
+  const filterCountSel = document.getElementById('filter-count');
 
   function getCards() {
     return Array.from(grid.querySelectorAll('.card'));
   }
 
-  function passes(card, q, f) {
+  function passes(card, q, f, fc) {
     const name = card.dataset.name || '';
     const count = parseInt(card.dataset.count, 10);
+    const samCount = parseInt(card.dataset.samCount, 10);
     const status = card.dataset.status;
     if (q && !name.includes(q)) return false;
     if (f === 'ok' && status !== 'ok') return false;
@@ -360,15 +371,20 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
     if (f === 'ge2' && !(count >= 2)) return false;
     if (f === 'ge3' && !(count >= 3)) return false;
     if (f === 'parseerr' && !(count < 0 && status === 'ok')) return false;
+    if (fc === 'eq0' && samCount !== 0) return false;
+    if (fc === 'eq1' && samCount !== 1) return false;
+    if (fc === 'eq2' && samCount !== 2) return false;
+    if (fc === 'ge3' && !(samCount >= 3)) return false;
     return true;
   }
 
   function apply() {
     const q = (search.value || '').trim().toLowerCase();
     const f = filterSel.value;
+    const fc = filterCountSel.value;
     const s = sortSel.value;
     const cards = getCards();
-    cards.forEach(c => { c.hidden = !passes(c, q, f); });
+    cards.forEach(c => { c.hidden = !passes(c, q, f, fc); });
     const visible = cards.filter(c => !c.hidden);
     const cmp = {
       'name-asc': (a, b) => (a.dataset.name || '').localeCompare(b.dataset.name || ''),
@@ -384,6 +400,7 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
   search.addEventListener('input', apply);
   sortSel.addEventListener('change', apply);
   filterSel.addEventListener('change', apply);
+  filterCountSel.addEventListener('change', apply);
   apply();
 
   // Per-card tab switching: click a .tab to show the matching .view
