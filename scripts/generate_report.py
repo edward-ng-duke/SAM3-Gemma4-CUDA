@@ -105,14 +105,12 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
 .card > summary::-webkit-details-marker { display: none; }
 .filename { flex: 1; font-size: 1rem; font-family: "IBM Plex Mono", ui-monospace, monospace; word-break: break-all; line-height: 1.3; }
 .badge { font-weight: 700; padding: 5px 14px; border-radius: 999px; font-size: 0.9rem; flex-shrink: 0; color: white; }
-.badge-sam { background: #555; }
-.badge-gemma.count-bucket-0 { background: #999; }
-.badge-gemma.count-bucket-1 { background: #4682B4; }
-.badge-gemma.count-bucket-2 { background: #2e8b57; }
-.badge-gemma.count-bucket-3 { background: #e67e22; }
-.badge-gemma.count-bucket-ge4 { background: #8e44ad; }
-.badge-gemma.count-bucket-err { background: #c0392b; }
-.badge-gemma.count-bucket-parseerr { background: #d63384; }
+.badge-count.count-bucket-0 { background: #999; }
+.badge-count.count-bucket-1 { background: #4682B4; }
+.badge-count.count-bucket-2 { background: #2e8b57; }
+.badge-count.count-bucket-3 { background: #e67e22; }
+.badge-count.count-bucket-ge4 { background: #8e44ad; }
+.badge-count.count-bucket-err { background: #c0392b; }
 .card .body { padding-top: 12px; border-top: 1px solid #eee; margin-top: 10px; }
 .tabs { display: flex; gap: 0; margin-bottom: 12px; border-bottom: 2px solid #e5e5e5; }
 .tab { background: none; border: none; padding: 8px 18px; cursor: pointer; font-size: 0.95rem; border-bottom: 3px solid transparent; margin-bottom: -2px; font-weight: 600; color: #666; transition: color 0.1s; }
@@ -144,12 +142,12 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
     parts_html.append('<html lang="zh-CN">')
     parts_html.append("<head>")
     parts_html.append('  <meta charset="utf-8">')
-    parts_html.append("  <title>SAM3 + Gemma 4 Person Detection Report</title>")
+    parts_html.append("  <title>人数检测报告</title>")
     parts_html.append(f"  <style>{css}</style>")
     parts_html.append("</head>")
     parts_html.append("<body>")
     parts_html.append("  <header>")
-    parts_html.append("    <h1>SAM3 + Gemma 4 Person Detection Report</h1>")
+    parts_html.append("    <h1>人数检测报告</h1>")
     parts_html.append(
         f'    <p class="meta">Generated <span id="generated-at">{html_escape(now)}</span> · {n_images} images</p>'
     )
@@ -163,13 +161,9 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
     parts_html.append('      <option value="count-asc">Persons ↑</option>')
     parts_html.append("    </select>")
     parts_html.append('    <select id="filter">')
-    parts_html.append('      <option value="all">All</option>')
-    parts_html.append('      <option value="ok">OK only</option>')
-    parts_html.append('      <option value="error">Errors only</option>')
-    parts_html.append('      <option value="ge1">Persons ≥ 1</option>')
-    parts_html.append('      <option value="ge2">Persons ≥ 2</option>')
-    parts_html.append('      <option value="ge3">Persons ≥ 3</option>')
-    parts_html.append('      <option value="parseerr">Gemma parse_error</option>')
+    parts_html.append('      <option value="all">全部</option>')
+    parts_html.append('      <option value="ok">仅成功</option>')
+    parts_html.append('      <option value="error">仅失败</option>')
     parts_html.append("    </select>")
     parts_html.append('    <select id="filter-count" title="按 SAM person 数精确过滤">')
     parts_html.append('      <option value="all">所有人数</option>')
@@ -184,10 +178,6 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
 
     for item in items:
         status = item.get("status") or ""
-        try:
-            num_persons = int(item.get("num_persons", 0))
-        except (TypeError, ValueError):
-            num_persons = 0
 
         image_name = item.get("image") or ""
         image_path = item.get("image_path") or ""
@@ -203,100 +193,64 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
 
         stem = Path(image_name).stem if image_name else ""
         rel_sam = f"visualizations/{stem}_sam.png" if stem else ""
-        rel_gemma = f"visualizations/{stem}_gemma.png" if stem else ""
 
         try:
             sam_person_count = int((item.get("per_prompt_counts") or {}).get("person", 0))
         except (TypeError, ValueError):
             sam_person_count = 0
 
-        # Badge text
-        if status == "error":
-            badge_text = "ERROR"
-        elif num_persons < 0:
-            badge_text = "?"
-        elif status == "ok" and num_persons == 0:
-            badge_text = "0"
-        elif status == "ok":
-            badge_text = str(num_persons)
-        else:
-            badge_text = str(num_persons)
-
-        # Count bucket
+        # Count bucket (based on SAM person count)
         if status == "error":
             bucket = "err"
-        elif num_persons < 0:
-            bucket = "parseerr"
-        elif num_persons == 0:
-            bucket = "0"
-        elif num_persons == 1:
-            bucket = "1"
-        elif num_persons == 2:
-            bucket = "2"
-        elif num_persons == 3:
-            bucket = "3"
+            badge_text = "ERROR"
         else:
-            bucket = "ge4"
+            badge_text = f"人数 {sam_person_count}"
+            if sam_person_count == 0:
+                bucket = "0"
+            elif sam_person_count == 1:
+                bucket = "1"
+            elif sam_person_count == 2:
+                bucket = "2"
+            elif sam_person_count == 3:
+                bucket = "3"
+            else:
+                bucket = "ge4"
 
         status_attr = html_escape(status, quote=True)
         name_attr = html_escape(name_lower, quote=True)
-        count_attr = html_escape(str(num_persons), quote=True)
         rel_image_attr = html_escape(_url_path(rel_image), quote=True)
         rel_sam_attr = html_escape(_url_path(rel_sam), quote=True)
-        rel_gemma_attr = html_escape(_url_path(rel_gemma), quote=True)
 
-        sam_count_attr = html_escape(str(sam_person_count), quote=True)
+        count_attr = html_escape(str(sam_person_count), quote=True)
         parts_html.append(
             f'    <details open class="card status-{html_escape(status, quote=True)} count-bucket-{bucket}" '
-            f'data-count="{count_attr}" data-sam-count="{sam_count_attr}" '
+            f'data-count="{count_attr}" '
             f'data-status="{status_attr}" data-name="{name_attr}">'
         )
         parts_html.append("      <summary>")
         parts_html.append(
             f'        <span class="filename">{html_escape(image_name)}</span>'
         )
-        if status == "error":
-            parts_html.append(
-                f'        <span class="badge badge-gemma count-bucket-err">{html_escape(badge_text)}</span>'
-            )
-        else:
-            parts_html.append(
-                f'        <span class="badge badge-sam">SAM {sam_person_count}</span>'
-            )
-            parts_html.append(
-                f'        <span class="badge badge-gemma count-bucket-{bucket}">Gemma {html_escape(badge_text)}</span>'
-            )
+        parts_html.append(
+            f'        <span class="badge badge-count count-bucket-{bucket}">{html_escape(badge_text)}</span>'
+        )
         parts_html.append("      </summary>")
         parts_html.append('      <div class="body">')
 
         if status == "ok":
-            # Tabs: Original | SAM | Gemma
+            # Tabs: 原图 | 标注图
             parts_html.append('        <div class="tabs">')
             parts_html.append('          <button class="tab active" data-tab="orig">原图</button>')
-            parts_html.append('          <button class="tab" data-tab="sam">SAM</button>')
-            parts_html.append('          <button class="tab" data-tab="gemma">Gemma</button>')
+            parts_html.append('          <button class="tab" data-tab="annot">标注图</button>')
             parts_html.append("        </div>")
             parts_html.append('        <div class="views">')
             parts_html.append(
                 f'          <figure class="view view-orig active"><figcaption>原图</figcaption><img src="{rel_image_attr}" loading="lazy"></figure>'
             )
             parts_html.append(
-                f'          <figure class="view view-sam"><figcaption>SAM raw — colored by prompt (person=red, face=orange, head=yellow, hands=green, arm=teal, shoulder=blue, torso=indigo, legs=purple, feet=pink)</figcaption><img src="{rel_sam_attr}" loading="lazy"></figure>'
-            )
-            parts_html.append(
-                f'          <figure class="view view-gemma"><figcaption>Gemma grouped — one color per detected person</figcaption><img src="{rel_gemma_attr}" loading="lazy"></figure>'
+                f'          <figure class="view view-annot"><figcaption>标注图 — 按部位上色（person=红, face=橙, head=黄, hands=绿, arm=青, shoulder=蓝, torso=靛, legs=紫, feet=粉）</figcaption><img src="{rel_sam_attr}" loading="lazy"></figure>'
             )
             parts_html.append("        </div>")
-
-            # Reasoning
-            reasoning = item.get("reasoning")
-            if reasoning is None or reasoning == "":
-                reasoning_text = "(empty)"
-            else:
-                reasoning_text = str(reasoning)
-            parts_html.append(
-                f'        <blockquote class="reasoning">{html_escape(reasoning_text)}</blockquote>'
-            )
 
             # Per-prompt counts table
             per_prompt = item.get("per_prompt_counts") or {}
@@ -311,23 +265,6 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
                 f"<tbody><tr>{counts_row}</tr></tbody></table>"
             )
 
-            # Persons list
-            persons = item.get("persons") or []
-            parts_html.append('        <ul class="persons">')
-            if not persons:
-                parts_html.append("          <li>(none)</li>")
-            else:
-                for p in persons:
-                    pid = p.get("person_id", "?") if isinstance(p, dict) else "?"
-                    raw_parts = p.get("parts", []) if isinstance(p, dict) else []
-                    if raw_parts:
-                        parts_str = ", ".join(str(x) for x in raw_parts)
-                    else:
-                        parts_str = "(no parts)"
-                    parts_html.append(
-                        f"          <li>P{html_escape(str(pid))}: {html_escape(parts_str)}</li>"
-                    )
-            parts_html.append("        </ul>")
         elif status == "error":
             err_msg = item.get("error_message") or ""
             parts_html.append(
@@ -362,19 +299,14 @@ header .meta { color: #666; margin: 4px 0 0; font-size: 0.9rem; }
   function passes(card, q, f, fc) {
     const name = card.dataset.name || '';
     const count = parseInt(card.dataset.count, 10);
-    const samCount = parseInt(card.dataset.samCount, 10);
     const status = card.dataset.status;
     if (q && !name.includes(q)) return false;
     if (f === 'ok' && status !== 'ok') return false;
     if (f === 'error' && status !== 'error') return false;
-    if (f === 'ge1' && !(count >= 1)) return false;
-    if (f === 'ge2' && !(count >= 2)) return false;
-    if (f === 'ge3' && !(count >= 3)) return false;
-    if (f === 'parseerr' && !(count < 0 && status === 'ok')) return false;
-    if (fc === 'eq0' && samCount !== 0) return false;
-    if (fc === 'eq1' && samCount !== 1) return false;
-    if (fc === 'eq2' && samCount !== 2) return false;
-    if (fc === 'ge3' && !(samCount >= 3)) return false;
+    if (fc === 'eq0' && count !== 0) return false;
+    if (fc === 'eq1' && count !== 1) return false;
+    if (fc === 'eq2' && count !== 2) return false;
+    if (fc === 'ge3' && !(count >= 3)) return false;
     return true;
   }
 
