@@ -1,0 +1,44 @@
+# What we explicitly DO want in the image:
+#   servers.py app.py servers_client.py requirements.txt
+#   scripts/  examples/  models/facebook/sam3/
+# Everything else is excluded to keep the build context small.
+
+# Python virtualenv (we'll re-install inside the image)
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Git
+.git/
+.gitignore
+
+# Claude / IDE state
+.claude/
+.idea/
+.vscode/
+
+# Local dev artifacts
+followups.md
+docs/
+*.log
+/tmp/
+
+# The OTHER model — Gemma is no longer used by the code
+models/google/
+
+# Ad-hoc scripts and outputs from local runs
+scripts/__pycache__/
+*.tmp
+*.swp
+
+# CI / docker build cache
+.cache/
+.pytest_cache/
+node_modules/
+
+# Don't ship the env file with secrets
+.env
+.env.*
+!.env.example

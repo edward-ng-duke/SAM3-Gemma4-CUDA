@@ -1,0 +1,83 @@
+# Two services share one image (built from Dockerfile):
+#   - sam3-servers: holds SAM3 image / tracker / video models (GPU)
+#   - sam3-app:     Gradio UI + Qwen client (no model weights, no GPU)
+#
+# Everything is offline-capable except the OUTBOUND call to the Qwen VLM endpoint.
+# Override QWEN_BASE_URL etc. in `.env` next to this file if you have a different host.
+#
+# Quick start:
+#   docker compose build       # build the offline image (slow, ~15 min)
+#   docker compose up          # foreground; Ctrl+C stops both
+#   docker compose up -d       # background
+#   docker compose logs -f     # tail logs
+#   docker compose down        # stop & remove containers (keeps the volume)
+
+services:
+
+  sam3-servers:
+    image: sam3-cuda:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sam3-servers
+    command: ["python", "/app/servers.py"]
+    environment:
+      SAM3_PORT: "5050"
+      SAM3_HOST: "0.0.0.0"
+      # Where /v1/sam3/video writes its output mp4. This MUST be a path that
+      # the sam3-app container can also read (i.e. the shared volume below).
+      SAM3_VIDEO_OUT_DIR: "/var/sam3_data"
+    ports:
+      - "5050:5050"
+    volumes:
+      - sam3_data:/var/sam3_data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:5050/health | grep -q '\"sam3_video\":true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      # SAM3 cold-start (image + tracker + video) loads in ~30-45s; give it room.
+      start_period: 90s
+    restart: unless-stopped
+
+  sam3-app:
+    image: sam3-cuda:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sam3-app
+    command: ["python", "/app/app.py"]
+    environment:
+      # The Gradio process talks to servers via the docker network alias.
+      SAM3_SERVER_URL: "http://sam3-servers:5050"
+      # External Qwen 3.6 27B endpoint — override these in a sibling .env file.
+      QWEN_BASE_URL: "${QWEN_BASE_URL:-http://10.0.0.94:5000/v1}"
+      QWEN_MODEL: "${QWEN_MODEL:-qwen36-27b-fp8}"
+      QWEN_API_KEY: "${QWEN_API_KEY:-no_need}"
+      # Read the same shared volume so it can serve the mp4 path that
+      # sam3-servers wrote.
+      SAM3_VIDEO_OUT_DIR: "/var/sam3_data"
+    ports:
+      - "7860:7860"
+    volumes:
+      - sam3_data:/var/sam3_data
+    depends_on:
+      sam3-servers:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  sam3_data:
+    # Bind to a host dir if you want to keep / inspect the produced videos:
+    # driver: local
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /tmp/sam3_data
