@@ -1,13 +1,14 @@
 # syntax=docker/dockerfile:1.6
 #
-# Fully offline image bundling:
+# Fully offline single-container image bundling:
 #   - Python 3.10 venv with torch (cu124) + transformers + Gradio + FastAPI + OpenAI SDK
 #   - SAM3 weights at /app/models/facebook/sam3
-#   - The two entrypoints `python servers.py` (port 5050) and `python app.py` (port 7860)
-#     run from the SAME image; docker-compose decides which one each container runs.
+#   - tini as PID 1, /app/entrypoint.sh runs servers.py (5050) in background
+#     then execs app.py (Gradio, 7860) in the foreground — one container, two
+#     processes, talking over 127.0.0.1.
 #
 # Build:    docker build -t sam3-cuda:latest .
-# Run all:  docker compose up
+# Run:      docker compose up
 # Once built, the image runs offline (no internet needed at runtime).
 # The Qwen 3.6 VLM is an EXTERNAL service; configure with QWEN_BASE_URL env at runtime.
 
@@ -76,6 +77,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-0 \
         curl \
         ca-certificates \
+        tini \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
@@ -89,13 +91,18 @@ WORKDIR /app
 COPY servers.py servers_client.py app.py requirements.txt /app/
 COPY scripts/ /app/scripts/
 COPY examples/ /app/examples/
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # SAM3 model weights (≈6.5 GB) — pinned into the image so it runs offline.
 # Gemma is intentionally NOT copied (the project no longer uses it).
 COPY models/facebook/sam3/ /app/models/facebook/sam3/
 
-# Default ports the two services listen on
+# Ports: 5050 = SAM3 HTTP API (loopback inside container, optionally exposed),
+#        7860 = Gradio UI (mapped to GRADIO_HOST_PORT on the host).
 EXPOSE 5050 7860
 
-# Default command launches the SAM3 service. docker-compose overrides this for app.py.
-CMD ["python", "/app/servers.py"]
+# tini as PID 1 → forwards signals + reaps zombies. entrypoint.sh starts
+# servers.py in the background, waits for /health, then execs app.py.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/entrypoint.sh"]

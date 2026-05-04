@@ -35,12 +35,12 @@ help:
 	@echo ""
 	@echo "Docker (fully offline) targets:"
 	@echo "  make docker-build — build sam3-cuda:latest with SAM3 weights baked in (slow, ~15min)"
-	@echo "  make docker-up    — docker compose up -d  (sam3-servers + sam3-app)"
-	@echo "  make docker-down  — docker compose down (keeps the volume)"
+	@echo "  make docker-up    — docker compose up -d  (single 'sam3' container, two processes)"
+	@echo "  make docker-down  — docker compose down"
 	@echo "  make docker-logs  — docker compose logs -f"
 	@echo "  make docker-restart — docker compose restart"
-	@echo "  make docker-shell — open bash inside sam3-app for debugging"
-	@echo "  make docker-clean — docker compose down -v --rmi local (drops image + volume)"
+	@echo "  make docker-shell — open bash inside the sam3 container for debugging"
+	@echo "  make docker-clean — docker compose down -v --rmi local (drops image)"
 
 dev: stop venv install models dev-orchestrate
 
@@ -124,8 +124,9 @@ docker-build:
 
 docker-up:
 	$(DC) up -d
-	@echo "[docker] services started. Tail logs with 'make docker-logs'."
-	@echo "[docker] Gradio: http://localhost:7860   SAM3 health: http://localhost:5050/health"
+	@echo "[docker] container started. Tail logs with 'make docker-logs'."
+	@set -a; [ -f .env.docker ] && . ./.env.docker; set +a; \
+	echo "[docker] Gradio: http://localhost:$${GRADIO_HOST_PORT:-17860}   SAM3 health: http://localhost:$${SAM3_HOST_PORT:-5050}/health"
 
 docker-down:
 	$(DC) down
@@ -137,7 +138,7 @@ docker-restart:
 	$(DC) restart
 
 docker-shell:
-	$(DC) exec sam3-app bash
+	$(DC) exec sam3 bash
 
 docker-clean:
 	$(DC) down -v --rmi local

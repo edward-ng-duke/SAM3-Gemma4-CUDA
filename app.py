@@ -1191,10 +1191,10 @@ with gr.Blocks() as demo:
 
 
 if __name__ == "__main__":
-    # When running in two-container split mode, sam3-servers writes output
-    # videos to the shared volume `SAM3_VIDEO_OUT_DIR` (/var/sam3_data). The
-    # path lives outside Gradio's default allowed roots, so we have to add it
-    # explicitly or postprocess_data will refuse to move the file into cache.
+    # servers.py writes output videos to SAM3_VIDEO_OUT_DIR (/var/sam3_data by
+    # default). The path lives outside Gradio's default allowed roots, so we
+    # have to add it explicitly or postprocess_data will refuse to move the
+    # file into cache.
     _allowed = []
     _video_out = os.environ.get("SAM3_VIDEO_OUT_DIR")
     if _video_out:
@@ -1202,7 +1202,7 @@ if __name__ == "__main__":
 
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=int(os.environ.get("GRADIO_PORT", "7860")),
         css=css,
         mcp_server=True,
         theme=steel_blue_theme,
