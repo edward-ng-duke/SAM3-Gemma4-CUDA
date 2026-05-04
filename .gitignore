@@ -8,3 +8,4 @@ followups.md
 __pycache__/
 *.pyc
 .DS_Store
+.playwright-mcp/

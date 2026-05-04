@@ -41,7 +41,7 @@ from gradio.themes.utils import colors, fonts, sizes
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-MODEL_VL = "Qwen 3.6"
+MODEL_VL = "多模态模型"
 
 print(f"🖥️ Compute device (for Gradio glue only): {DEVICE}")
 print("ℹ️  This process holds no model weights.")
@@ -109,6 +109,13 @@ css = r"""
 
 body, .gradio-container { font-family: 'Outfit', sans-serif !important; }
 footer { display: none !important; }
+
+/* Gradio 6.14 ships a 1x1 absolute-positioned hidden tab row used for width
+   measurement; it lands at the vertical center of the real tablist and steals
+   clicks (it has pointer-events: auto by default). Disable hit-testing on it
+   so clicks reach the real tabs underneath. */
+.tab-container.visually-hidden,
+.tab-container.visually-hidden * { pointer-events: none !important; }
 
 .app-header {
     background: linear-gradient(135deg, #1E3450 0%, #264364 30%, #3E72A0 70%, #4682B4 100%);
@@ -468,7 +475,7 @@ def run_sam3_qwen_detection(image, prompt, conf_thresh):
     try:
         regions = sam3_detect(image, prompt, conf_threshold=float(conf_thresh))
     except ServerError as e:
-        raise gr.Error(f"SAM3 服务不可达：{e}")
+        raise gr.Error(f"分割检测服务不可达：{e}")
     except Exception as e:
         raise gr.Error(f"检测过程出错：{e}")
 
@@ -477,7 +484,7 @@ def run_sam3_qwen_detection(image, prompt, conf_thresh):
             "prompt": prompt,
             "num_selected": 0,
             "selected_regions": [],
-            "vl_reason": "SAM3 未找到任何候选区域。"
+            "vl_reason": "分割检测模型未找到任何候选区域。"
         }
         return image, image, json.dumps(empty_json, indent=2), "没有检测到任何目标。"
 
@@ -499,9 +506,9 @@ def run_sam3_qwen_detection(image, prompt, conf_thresh):
     try:
         vl_result = qwen_filter_regions(image, candidate_regions, prompt)
     except ServerError as e:
-        raise gr.Error(f"VLM 服务不可达：{e}")
+        raise gr.Error(f"多模态服务不可达：{e}")
     except Exception as e:
-        raise gr.Error(f"VLM 过滤过程出错：{e}")
+        raise gr.Error(f"多模态过滤过程出错：{e}")
 
     selected_idx = vl_result.get("selected_region_indexes", [])
     reason = vl_result.get("reason", "")
@@ -523,8 +530,8 @@ def run_sam3_qwen_detection(image, prompt, conf_thresh):
     final_json = format_json_output(selected_regions, reason, prompt)
 
     status = (
-        f"SAM3 出 {len(candidate_regions)} 个候选区域，"
-        f"{MODEL_VL} 选中 {len(selected_regions)} 个。"
+        f"分割检测出 {len(candidate_regions)} 个候选区域，"
+        f"{MODEL_VL}选中 {len(selected_regions)} 个。"
     )
 
     return sam3_vis, final_vis, json.dumps(final_json, indent=2), status
@@ -545,7 +552,7 @@ def run_video_segmentation(video_path, prompt, frame_limit, time_limit):
             render_mode="annotated",
         )
     except ServerError as e:
-        return None, f"SAM3 服务不可达：{e}"
+        return None, f"分割检测服务不可达：{e}"
     except Exception as e:
         return None, f"视频处理出错：{str(e)}"
 
@@ -571,7 +578,7 @@ def run_video_segmentation_mask(video_path, prompt, frame_limit, time_limit):
             render_mode="mask",
         )
     except ServerError as e:
-        return None, f"SAM3 服务不可达：{e}"
+        return None, f"分割检测服务不可达：{e}"
     except Exception as e:
         return None, f"视频 mask 处理出错：{str(e)}"
 
@@ -620,7 +627,7 @@ def _pil_to_data_url(image: Image.Image) -> str:
 
 
 def run_qa_detect_and_crop(image, prompt, conf_thresh):
-    """SAM3 detect → crop bbox per region → return gallery + crops state."""
+    """Detect → crop bbox per region → return gallery + crops state."""
     if image is None:
         raise gr.Error("请先上传一张图片。")
     if not prompt or not prompt.strip():
@@ -631,7 +638,7 @@ def run_qa_detect_and_crop(image, prompt, conf_thresh):
     try:
         regions = sam3_detect(image, prompt, conf_threshold=float(conf_thresh), return_masks=False)
     except ServerError as e:
-        raise gr.Error(f"SAM3 服务不可达：{e}")
+        raise gr.Error(f"分割检测服务不可达：{e}")
 
     if len(regions) == 0:
         return [], [], None, [], "没有检测到任何目标。"
@@ -647,7 +654,7 @@ def run_qa_detect_and_crop(image, prompt, conf_thresh):
         captions.append(f"#{r.region_index} score={r.score:.2f} bbox=({x1},{y1},{x2},{y2})")
 
     gallery_value = list(zip(crops, captions))
-    status = f"SAM3 返回 {len(regions)} 个候选区域，已生成 {len(crops)} 张抠图。"
+    status = f"分割检测返回 {len(regions)} 个候选区域，已生成 {len(crops)} 张抠图。"
     return gallery_value, crops, None, [], status
 
 
@@ -702,7 +709,7 @@ def chat_with_qwen(message, history, selected_crop):
             new_history[-1] = {"role": "assistant", "content": partial}
             yield new_history, ""
     except ServerError as e:
-        new_history[-1] = {"role": "assistant", "content": partial + f"\n\n[VLM 错误：{e}]"}
+        new_history[-1] = {"role": "assistant", "content": partial + f"\n\n[多模态错误：{e}]"}
         yield new_history, ""
 
 
@@ -745,7 +752,7 @@ def explain_detection(image, prompt, detection_json_text):
             full_text += chunk
             yield full_text
     except ServerError as e:
-        raise gr.Error(f"VLM 服务不可达：{e}")
+        raise gr.Error(f"多模态服务不可达：{e}")
 
 
 def html_header():
@@ -754,13 +761,13 @@ def html_header():
         <div class="header-content">
             <div class="header-icon-wrap">{T_LOGO_SVG}</div>
             <div class="header-text">
-                <h1>SAM3 + Qwen — 图像与视频分割</h1>
+                <h1>图像与视频分割</h1>
                 <div class="header-meta">
-                    <span class="meta-badge">{SVG_CHIP} SAM3 服务 @ {SAM3_SERVER_URL}</span>
+                    <span class="meta-badge">{SVG_CHIP} 分割检测模型服务</span>
                     <span class="meta-sep"></span>
-                    <span class="meta-cap">SAM3 候选区域</span>
+                    <span class="meta-cap">候选区域</span>
                     <span class="meta-sep"></span>
-                    <span class="meta-cap">Qwen 过滤</span>
+                    <span class="meta-cap">多模态过滤</span>
                     <span class="meta-sep"></span>
                     <span class="meta-cap">图像 + 视频分割</span>
                 </div>
@@ -825,12 +832,12 @@ with gr.Blocks() as demo:
     gr.HTML(html_header())
 
     with gr.Tabs():
-        with gr.Tab("图像检测（带过滤）"):
+        with gr.Tab("图像检测"):
             gr.HTML(html_tab_intro(
                 SVG_IMAGE,
-                "SAM3 + Qwen 图像检测",
-                "SAM3 先根据你的文本提示输出候选 mask 和区域。Qwen 再对这些候选做过滤，只保留最匹配你描述的那些。",
-                "图像模式：SAM3 出候选，Qwen 过滤最终结果。",
+                "图像检测",
+                "分割检测模型先根据你的文本提示输出候选 mask 和区域。多模态模型再对这些候选做过滤，只保留最匹配你描述的那些。",
+                "图像模式：分割检测出候选，多模态过滤最终结果。",
             ))
 
             with gr.Row():
@@ -850,10 +857,10 @@ with gr.Blocks() as demo:
                             maximum=1.0,
                             value=0.45,
                             step=0.05,
-                            label="SAM3 置信度阈值",
+                            label="分割检测置信度阈值",
                         )
 
-                    detect_btn = gr.Button("运行 SAM3 + Qwen 检测", variant="primary")
+                    detect_btn = gr.Button("运行检测", variant="primary")
                     explain_btn = gr.Button("解释结果", variant="secondary")
 
                     gr.HTML(html_divider())
@@ -865,11 +872,11 @@ with gr.Blocks() as demo:
                     )
 
                 with gr.Column(scale=1):
-                    gr.HTML(html_section_heading(SVG_DETECT, "SAM3 候选区域"))
-                    sam3_output = gr.Image(label="SAM3 结果", height=300)
+                    gr.HTML(html_section_heading(SVG_DETECT, "分割检测候选区域"))
+                    sam3_output = gr.Image(label="分割检测结果", height=300)
 
-                    gr.HTML(html_section_heading(SVG_OUTPUT, "Qwen 过滤后的最终检测"))
-                    final_output = gr.Image(label="SAM3 + Qwen 结果", height=300)
+                    gr.HTML(html_section_heading(SVG_OUTPUT, "多模态过滤后的最终检测"))
+                    final_output = gr.Image(label="最终检测结果", height=300)
 
                     gr.Markdown(
                         f"""
@@ -878,15 +885,15 @@ with gr.Blocks() as demo:
                         #### 1. 上传图片 + 写提示词
                         - 上传你要分析的图片，写一句清晰的检测描述。
 
-                        #### 2. 调整 SAM3 设置
-                        - 用 **置信度阈值滑块** 控制 SAM3 的严格程度：
+                        #### 2. 调整分割检测设置
+                        - 用 **置信度阈值滑块** 控制分割检测模型的严格程度：
                           - **值越低** → 候选越多，**值越高** → 候选越少越干净。
 
                         #### 3. 运行检测与解释
-                        - 点 **"运行 SAM3 + Qwen 检测"**
-                        - **上方面板：** SAM3 候选区域，**下方面板：** Qwen 过滤后的最终检测
+                        - 点 **"运行检测"**
+                        - **上方面板：** 分割检测候选区域，**下方面板：** 多模态过滤后的最终检测
                         - **JSON 输出：** 结构化结果，含 bbox、score、label
-                        - 点 **"解释结果"** 让 Qwen 用自然语言说明为什么这么选
+                        - 点 **"解释结果"** 让多模态模型用自然语言说明为什么这么选
                         """
                     )
 
@@ -897,10 +904,10 @@ with gr.Blocks() as demo:
                     status_output = gr.Textbox(label="系统状态", interactive=False)
 
                     gr.HTML(html_status_indicator(
-                        "流水线：SAM3 出候选 → Qwen 过滤相关检测。"
+                        "流水线：分割检测出候选 → 多模态过滤相关检测。"
                     ))
 
-                    gr.HTML(html_section_heading(SVG_TEXT, "Qwen 解释"))
+                    gr.HTML(html_section_heading(SVG_TEXT, "多模态解释"))
                     explanation_output = gr.Textbox(label="解释", lines=15, interactive=True)
 
             detect_btn.click(
@@ -915,10 +922,10 @@ with gr.Blocks() as demo:
                 outputs=[explanation_output],
             )
 
-        with gr.Tab("视频分割（纯 mask）"):
+        with gr.Tab("视频 mask"):
             gr.HTML(html_tab_intro(
                 SVG_VIDEO,
-                "SAM3 视频分割（mask 叠加）",
+                "视频分割（mask 叠加）",
                 "用文本提示在视频每一帧里分割目标物体，仅在原始帧上渲染彩色 mask 叠加层。",
                 "视频模式：文本提示分割，仅显示 mask 叠加。",
             ))
@@ -966,7 +973,7 @@ with gr.Blocks() as demo:
                     video_status_mask = gr.Textbox(label="系统状态", interactive=False)
 
                     gr.HTML(html_status_indicator(
-                        "流水线：SAM3 视频 session → 提示词条件化 → mask 在帧间传播并叠加渲染。"
+                        "流水线：分割检测视频 session → 提示词条件化 → mask 在帧间传播并叠加渲染。"
                     ))
 
             video_btn_mask.click(
@@ -975,11 +982,11 @@ with gr.Blocks() as demo:
                 outputs=[video_output_mask, video_status_mask],
             )
 
-        with gr.Tab("视频分割（带标注）"):
+        with gr.Tab("视频标注"):
             gr.HTML(html_tab_intro(
                 SVG_VIDEO,
-                "SAM3 视频分割",
-                "用文本提示在视频帧间分割目标物体。SAM3 视频模型初始化一个视频 session，然后把分割 mask 在整段视频里传播。",
+                "视频分割",
+                "用文本提示在视频帧间分割目标物体。分割检测模型初始化一个视频 session，然后把分割 mask 在整段视频里传播。",
                 "视频模式：文本提示分割，输出带 mask、轮廓与边界框。",
             ))
 
@@ -1026,7 +1033,7 @@ with gr.Blocks() as demo:
                     video_status = gr.Textbox(label="系统状态", interactive=False)
 
                     gr.HTML(html_status_indicator(
-                        "流水线：SAM3 视频 session → 提示词条件化 → mask 在帧间传播，输出含轮廓与边界框。"
+                        "流水线：分割检测视频 session → 提示词条件化 → mask 在帧间传播，输出含轮廓与边界框。"
                     ))
 
             video_btn.click(
@@ -1038,8 +1045,8 @@ with gr.Blocks() as demo:
         with gr.Tab("点选分割"):
             gr.HTML(html_tab_intro(
                 SVG_IMAGE,
-                "SAM3 Tracker 交互式点选分割",
-                "上传图片，然后在你想分割的物体上点击。每次点击都被当作一个前景点累加，tracker 模型会实时更新 mask 预览。",
+                "交互式点选分割",
+                "上传图片，然后在你想分割的物体上点击。每次点击都被当作一个前景点累加，分割检测模型会实时更新 mask 预览。",
                 "交互模式：累计前景点点击式分割。",
             ))
 
@@ -1069,7 +1076,7 @@ with gr.Blocks() as demo:
                     )
 
                     gr.HTML(html_status_indicator(
-                        "流水线：点击坐标 → SAM3 tracker 提示编码 → mask 预测叠加。"
+                        "流水线：点击坐标 → 分割检测模型提示编码 → mask 预测叠加。"
                     ))
 
             img_click_input.select(
@@ -1083,12 +1090,12 @@ with gr.Blocks() as demo:
                 outputs=[img_click_output, st_click_points, st_click_labels]
             )
 
-        with gr.Tab("图像问答（抠图 + 聊天）"):
+        with gr.Tab("图像问答"):
             gr.HTML(html_tab_intro(
                 SVG_TEXT,
-                "图像问答 —— SAM3 抠图 + Qwen 对话",
-                "上传一张图和一句提示词，SAM3 会检测出所有候选区域并裁剪出来。在 Gallery 里点选一张，再针对它跟 Qwen 3.6 27B 聊天提问。",
-                f"VLM 端点：{QWEN_BASE_URL} • 模型：{QWEN_MODEL}",
+                "图像问答 —— 抠图 + 多模态对话",
+                "上传一张图和一句提示词，分割检测模型会检测出所有候选区域并裁剪出来。在 Gallery 里点选一张，再针对它跟多模态模型聊天提问。",
+                "多模态对话已就绪。",
             ))
 
             qa_crops_state = gr.State([])
@@ -1107,7 +1114,7 @@ with gr.Blocks() as demo:
                     with gr.Accordion("高级设置", open=False):
                         qa_conf_slider = gr.Slider(
                             minimum=0.0, maximum=1.0, value=0.45, step=0.05,
-                            label="SAM3 置信度阈值",
+                            label="分割检测置信度阈值",
                         )
                     qa_detect_btn = gr.Button("检测并抠图", variant="primary")
                     qa_status = gr.Textbox(label="状态", interactive=False)
@@ -1136,9 +1143,9 @@ with gr.Blocks() as demo:
                         height=240,
                         interactive=False,
                     )
-                    gr.HTML(html_section_heading(SVG_TEXT, "与 Qwen 对话"))
+                    gr.HTML(html_section_heading(SVG_TEXT, "与多模态模型对话"))
                     qa_chatbot = gr.Chatbot(
-                        label="Qwen",
+                        label="多模态对话",
                         height=320,
                     )
                     with gr.Row():
@@ -1184,6 +1191,15 @@ with gr.Blocks() as demo:
 
 
 if __name__ == "__main__":
+    # When running in two-container split mode, sam3-servers writes output
+    # videos to the shared volume `SAM3_VIDEO_OUT_DIR` (/var/sam3_data). The
+    # path lives outside Gradio's default allowed roots, so we have to add it
+    # explicitly or postprocess_data will refuse to move the file into cache.
+    _allowed = []
+    _video_out = os.environ.get("SAM3_VIDEO_OUT_DIR")
+    if _video_out:
+        _allowed.append(os.path.abspath(_video_out))
+
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
@@ -1192,4 +1208,5 @@ if __name__ == "__main__":
         theme=steel_blue_theme,
         show_error=True,
         ssr_mode=False,
+        allowed_paths=_allowed or None,
     )

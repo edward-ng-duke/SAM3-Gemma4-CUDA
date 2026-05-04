@@ -29,6 +29,8 @@ import io
 import json
 import os
 import re
+import shutil
+import uuid
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -147,6 +149,32 @@ def sam3_track(
     return overlay, bool(data.get("has_mask", False))
 
 
+def _stage_video_for_server(video_path: str) -> tuple[str, str | None]:
+    """If client and server live in different containers, copy the input video
+    into a directory both can read (the shared volume) and return that staged
+    path. Returns (path_to_send, path_to_cleanup_or_None).
+
+    Staging dir is `SAM3_VIDEO_STAGE_DIR`, falling back to `SAM3_VIDEO_OUT_DIR`.
+    When neither is set we assume client and server share a filesystem and
+    pass the path through unchanged.
+    """
+    abs_path = os.path.abspath(video_path)
+    stage_dir = os.environ.get("SAM3_VIDEO_STAGE_DIR") or os.environ.get("SAM3_VIDEO_OUT_DIR")
+    if not stage_dir:
+        return abs_path, None
+
+    stage_dir = os.path.abspath(stage_dir)
+    if abs_path.startswith(stage_dir + os.sep):
+        return abs_path, None
+
+    inputs_dir = os.path.join(stage_dir, "inputs")
+    os.makedirs(inputs_dir, exist_ok=True)
+    suffix = os.path.splitext(abs_path)[1] or ".mp4"
+    staged = os.path.join(inputs_dir, f"{uuid.uuid4().hex}{suffix}")
+    shutil.copyfile(abs_path, staged)
+    return staged, staged
+
+
 def sam3_video(
     video_path: str,
     prompt: str,
@@ -154,14 +182,25 @@ def sam3_video(
     time_limit: int = 60,
     render_mode: str = "annotated",
 ) -> tuple[str, int, int]:
+    if not video_path or not os.path.isfile(video_path):
+        raise ServerError(f"input video not found: {video_path}")
+
+    send_path, cleanup_path = _stage_video_for_server(video_path)
     payload = {
-        "video_path": os.path.abspath(video_path),
+        "video_path": send_path,
         "prompt": prompt,
         "frame_limit": int(frame_limit),
         "time_limit": int(time_limit),
         "render_mode": render_mode,
     }
-    data = _post("/v1/sam3/video", payload, timeout=1800.0)
+    try:
+        data = _post("/v1/sam3/video", payload, timeout=1800.0)
+    finally:
+        if cleanup_path:
+            try:
+                os.unlink(cleanup_path)
+            except OSError:
+                pass
     return (
         data["output_video_path"],
         int(data.get("processed_frames", 0)),

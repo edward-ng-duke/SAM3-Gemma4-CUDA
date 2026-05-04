@@ -25,7 +25,10 @@ services:
       SAM3_PORT: "5050"
       SAM3_HOST: "0.0.0.0"
       # Where /v1/sam3/video writes its output mp4. This MUST be a path that
-      # the sam3-app container can also read (i.e. the shared volume below).
+      # the sam3-app container can also read (i.e. the shared volume below) —
+      # sam3-app also stages user-uploaded input videos into <dir>/inputs/
+      # so this server can read them. Override per-side with
+      # SAM3_VIDEO_STAGE_DIR (client) if you ever want to split them.
       SAM3_VIDEO_OUT_DIR: "/var/sam3_data"
     ports:
       - "5050:5050"
@@ -61,8 +64,10 @@ services:
       QWEN_BASE_URL: "${QWEN_BASE_URL:-http://10.0.0.94:5000/v1}"
       QWEN_MODEL: "${QWEN_MODEL:-qwen36-27b-fp8}"
       QWEN_API_KEY: "${QWEN_API_KEY:-no_need}"
-      # Read the same shared volume so it can serve the mp4 path that
-      # sam3-servers wrote.
+      # Same shared volume as sam3-servers: this side reads the output mp4
+      # that the server wrote, and stages uploaded input videos into
+      # <dir>/inputs/ so the server can read them. Set SAM3_VIDEO_STAGE_DIR
+      # to override the staging dir independently of the output dir.
       SAM3_VIDEO_OUT_DIR: "/var/sam3_data"
     ports:
       - "7860:7860"
