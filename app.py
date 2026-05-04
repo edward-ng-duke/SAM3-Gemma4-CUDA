@@ -1,8 +1,12 @@
 import os
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+import base64
+import io
 import json
-import ast
 import re
-import cv2
 import tempfile
 import spaces
 import gradio as gr
@@ -10,21 +14,24 @@ import numpy as np
 import torch
 import matplotlib
 from PIL import Image, ImageDraw, ImageFont
-from threading import Thread
 from typing import Iterable
 
 import supervision as sv
 
-from transformers import (
-    Sam3Model,
-    Sam3Processor,
-    Sam3VideoModel,
-    Sam3VideoProcessor,
-    Sam3TrackerModel,
-    Sam3TrackerProcessor,
-    Gemma4ForConditionalGeneration,
-    AutoProcessor,
-    TextIteratorStreamer,
+from servers_client import (
+    sam3_detect,
+    sam3_track,
+    sam3_video,
+    vlm_generate,
+    vlm_generate_stream,
+    vlm_chat_stream,
+    safe_parse_json,
+    health as sam3_health,
+    ServerError,
+    SAM3_SERVER_URL,
+    QWEN_BASE_URL,
+    QWEN_MODEL,
+    DetectedRegion,
 )
 
 from gradio.themes import Soft
@@ -32,19 +39,12 @@ from gradio.themes.utils import colors, fonts, sizes
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-VL_DTYPE = (
-    torch.bfloat16
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    else (torch.float16 if torch.cuda.is_available() else torch.float32)
-)
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
-SAM_MODEL_NAME = "facebook/sam3"
-VL_MODEL_NAME = "google/gemma-4-E2B-it"
+MODEL_VL = "Qwen 3.6"
 
-MODEL_VL = "Gemma 4"
-
-print(f"🖥️ Using compute device: {DEVICE}")
-print("⏳ Loading models permanently into memory...")
+print(f"🖥️ Compute device (for Gradio glue only): {DEVICE}")
+print("ℹ️  This process holds no model weights.")
 
 
 colors.steel_blue = colors.Color(
@@ -269,42 +269,8 @@ SVG_CHIP = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 
 SVG_VIDEO = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m15.75 10.5 4.72-2.36A.75.75 0 0 1 21.75 8.81v6.38a.75.75 0 0 1-1.28.67l-4.72-2.36m0-3v3m-10.5 6h9A2.25 2.25 0 0 0 16.5 17.25V6.75A2.25 2.25 0 0 0 14.25 4.5h-9A2.25 2.25 0 0 0 3 6.75v10.5A2.25 2.25 0 0 0 5.25 19.5Z"/></svg>'
 
 
-try:
-    print("   ... Loading SAM3 image model")
-    SAM_MODEL = Sam3Model.from_pretrained(SAM_MODEL_NAME).to(DEVICE)
-    SAM_PROCESSOR = Sam3Processor.from_pretrained(SAM_MODEL_NAME)
-
-    print("   ... Loading SAM3 tracker model")
-    TRK_MODEL = Sam3TrackerModel.from_pretrained(SAM_MODEL_NAME).to(DEVICE)
-    TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(SAM_MODEL_NAME)
-
-    print("   ... Loading SAM3 video model")
-    VID_MODEL = Sam3VideoModel.from_pretrained(SAM_MODEL_NAME).to(DEVICE, dtype=torch.bfloat16)
-    VID_PROCESSOR = Sam3VideoProcessor.from_pretrained(SAM_MODEL_NAME)
-
-    print("   ... Loading Gemma 4 model")
-    VL_MODEL = Gemma4ForConditionalGeneration.from_pretrained(
-        VL_MODEL_NAME,
-        torch_dtype=VL_DTYPE,
-        device_map="auto" if torch.cuda.is_available() else None,
-    ).eval()
-    if not torch.cuda.is_available():
-        VL_MODEL = VL_MODEL.to(DEVICE)
-
-    VL_PROCESSOR = AutoProcessor.from_pretrained(VL_MODEL_NAME)
-
-    print("✅ All models loaded successfully!")
-
-except Exception as e:
-    print(f"❌ CRITICAL ERROR LOADING MODELS: {e}")
-    SAM_MODEL = None
-    SAM_PROCESSOR = None
-    TRK_MODEL = None
-    TRK_PROCESSOR = None
-    VID_MODEL = None
-    VID_PROCESSOR = None
-    VL_MODEL = None
-    VL_PROCESSOR = None
+print(f"[app] SAM3 service: {SAM3_SERVER_URL}")
+print(f"[app] VLM (Qwen):   {QWEN_BASE_URL} model={QWEN_MODEL}")
 
 
 BRIGHT_YELLOW = sv.Color(r=255, g=230, b=0)
@@ -328,21 +294,6 @@ VIDEO_COLORS_BGR = [
 ]
 
 
-def safe_parse_json(text: str):
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text)
-    text = re.sub(r"```$", "", text)
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    try:
-        return ast.literal_eval(text)
-    except Exception:
-        return {}
-
-
 def clamp_box_xyxy(box, width, height):
     x1, y1, x2, y2 = box
     x1 = max(0, min(width - 1, int(x1)))
@@ -354,36 +305,6 @@ def clamp_box_xyxy(box, width, height):
     if y2 < y1:
         y1, y2 = y2, y1
     return [x1, y1, x2, y2]
-
-
-def build_vl_inputs(image: Image.Image, prompt_text: str):
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": prompt_text},
-        ]
-    }]
-
-    text = VL_PROCESSOR.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-
-    inputs = VL_PROCESSOR(
-        text=[text],
-        images=[image],
-        return_tensors="pt",
-        padding=True
-    )
-
-    if torch.cuda.is_available():
-        inputs = {k: v.to(VL_MODEL.device) if hasattr(v, "to") else v for k, v in inputs.items()}
-    else:
-        inputs = {k: v.to(DEVICE) if hasattr(v, "to") else v for k, v in inputs.items()}
-
-    return inputs
 
 
 def qwen_filter_regions(image: Image.Image, regions: list, user_prompt: str) -> dict:
@@ -420,25 +341,17 @@ Rules:
 - Do not return markdown.
 """
 
-    inputs = build_vl_inputs(image, instruction)
-
-    with torch.inference_mode():
-        gen_ids = VL_MODEL.generate(
-            **inputs,
-            max_new_tokens=512,
-            use_cache=True,
-            temperature=0.2,
-            do_sample=False,
-        )
-
-    raw = VL_PROCESSOR.batch_decode(
-        gen_ids[:, inputs["input_ids"].shape[1]:],
-        skip_special_tokens=True
-    )[0].strip()
+    raw = vlm_generate(
+        image,
+        instruction,
+        max_new_tokens=512,
+        temperature=0.2,
+        enable_thinking=False,
+    )
 
     parsed = safe_parse_json(raw)
     if not isinstance(parsed, dict):
-        parsed = {"selected_region_indexes": [], "reason": "Could not parse model output."}
+        parsed = {"selected_region_indexes": [], "reason": "无法解析模型输出。"}
 
     parsed.setdefault("selected_region_indexes", [])
     parsed.setdefault("reason", "")
@@ -544,492 +457,132 @@ def calc_timeout_duration(video_file, *args):
     return args[-1] if args else 60
 
 
-def extract_boxes_from_masks(mask_data, width, height):
-    boxes = []
-
-    if mask_data is None:
-        return boxes
-
-    if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
-
-    mask_data = np.array(mask_data)
-
-    if mask_data.ndim == 4:
-        mask_data = mask_data[0]
-    if mask_data.ndim == 3 and mask_data.shape[0] == 1:
-        mask_data = mask_data[0]
-
-    if mask_data.ndim == 2:
-        mask_data = np.expand_dims(mask_data, axis=0)
-
-    if mask_data.ndim != 3:
-        return boxes
-
-    for single_mask in mask_data:
-        single_mask = np.array(single_mask)
-        if single_mask.shape[:2] != (height, width):
-            single_mask = cv2.resize(
-                single_mask.astype(np.float32),
-                (width, height),
-                interpolation=cv2.INTER_NEAREST
-            )
-
-        binary = single_mask > 0
-        ys, xs = np.where(binary)
-        if len(xs) == 0 or len(ys) == 0:
-            boxes.append(None)
-            continue
-
-        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-        boxes.append(clamp_box_xyxy([x1, y1, x2, y2], width, height))
-
-    return boxes
-
-
-def draw_video_masks_contours_and_boxes(frame_bgr, mask_data, prompt_text, scores=None):
-    out = frame_bgr.copy()
-    h, w = out.shape[:2]
-
-    if mask_data is None:
-        return out
-
-    if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
-
-    mask_data = np.array(mask_data)
-
-    if mask_data.ndim == 4:
-        mask_data = mask_data.squeeze(1)
-    if mask_data.ndim == 2:
-        mask_data = np.expand_dims(mask_data, axis=0)
-
-    if mask_data.ndim != 3 or len(mask_data) == 0:
-        return out
-
-    boxes = extract_boxes_from_masks(mask_data, w, h)
-
-    for i in range(len(mask_data)):
-        color = VIDEO_COLORS_BGR[i % len(VIDEO_COLORS_BGR)]
-        mask = mask_data[i]
-
-        if mask.shape[:2] != (h, w):
-            mask = cv2.resize(
-                mask.astype(np.float32),
-                (w, h),
-                interpolation=cv2.INTER_NEAREST
-            )
-
-        binary = mask > 0
-        if not np.any(binary):
-            continue
-
-        for c in range(3):
-            out[:, :, c] = np.where(
-                binary,
-                (out[:, :, c].astype(np.float32) * 0.55 + color[c] * 0.45).astype(np.uint8),
-                out[:, :, c],
-            )
-
-        contours, _ = cv2.findContours(
-            binary.astype(np.uint8),
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-        cv2.drawContours(out, contours, -1, color, 2)
-
-        box = boxes[i]
-        if box is not None:
-            x1, y1, x2, y2 = box
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-
-            if scores is not None and i < len(scores):
-                try:
-                    label = f"{prompt_text} {float(scores[i]):.2f}"
-                except Exception:
-                    label = f"{prompt_text} #{i}"
-            else:
-                label = f"{prompt_text} #{i}"
-
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            y_top = max(y1 - th - 10, 0)
-            y_bottom = max(y1, th + 10)
-            cv2.rectangle(out, (x1, y_top), (x1 + tw + 6, y_bottom), color, -1)
-            cv2.putText(
-                out,
-                label,
-                (x1 + 3, max(y1 - 4, th + 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
-            )
-
-    return out
-
-
-def apply_mask_overlay(base_image, mask_data, opacity=0.5):
-    if isinstance(base_image, np.ndarray):
-        base_image = Image.fromarray(base_image)
-    base_image = base_image.convert("RGBA")
-
-    if mask_data is None:
-        return base_image.convert("RGB")
-
-    if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
-    mask_data = np.array(mask_data).astype(np.uint8)
-
-    if mask_data.ndim == 4:
-        mask_data = mask_data[0]
-    if mask_data.ndim == 3 and mask_data.shape[0] == 1:
-        mask_data = mask_data[0]
-
-    if mask_data.ndim == 2:
-        mask_data = [mask_data]
-        num_masks = 1
-    elif mask_data.ndim == 3:
-        num_masks = mask_data.shape[0]
-    else:
-        return base_image.convert("RGB")
-
-    try:
-        color_map = matplotlib.colormaps["rainbow"].resampled(max(num_masks, 1))
-    except AttributeError:
-        import matplotlib.cm as cm
-        color_map = cm.get_cmap("rainbow").resampled(max(num_masks, 1))
-
-    rgb_colors = [tuple(int(c * 255) for c in color_map(i)[:3]) for i in range(num_masks)]
-    composite_layer = Image.new("RGBA", base_image.size, (0, 0, 0, 0))
-
-    for i, single_mask in enumerate(mask_data):
-        mask_bitmap = Image.fromarray((single_mask * 255).astype(np.uint8))
-        if mask_bitmap.size != base_image.size:
-            mask_bitmap = mask_bitmap.resize(base_image.size, resample=Image.NEAREST)
-
-        fill_color = rgb_colors[i]
-        color_fill = Image.new("RGBA", base_image.size, fill_color + (0,))
-        mask_alpha = mask_bitmap.point(lambda v: int(v * opacity) if v > 0 else 0)
-        color_fill.putalpha(mask_alpha)
-        composite_layer = Image.alpha_composite(composite_layer, color_fill)
-
-    return Image.alpha_composite(base_image, composite_layer).convert("RGB")
-
-
-def draw_points_on_image(image, points):
-    if isinstance(image, np.ndarray):
-        image = Image.fromarray(image)
-
-    draw_img = image.copy()
-    draw = ImageDraw.Draw(draw_img)
-
-    for pt in points:
-        x, y = pt
-        r = 8
-        draw.ellipse((x - r, y - r, x + r, y + r), fill="red", outline="white", width=4)
-
-    return draw_img
-
-
-@spaces.GPU
 def run_sam3_qwen_detection(image, prompt, conf_thresh):
-    if SAM_MODEL is None or SAM_PROCESSOR is None or VL_MODEL is None or VL_PROCESSOR is None:
-        raise gr.Error("Models failed to load on startup.")
-
     if image is None:
-        raise gr.Error("Please upload an image.")
+        raise gr.Error("请先上传一张图片。")
     if not prompt or not prompt.strip():
-        raise gr.Error("Please provide a text prompt.")
+        raise gr.Error("请填写文本提示词。")
+
+    image = image.convert("RGB")
 
     try:
-        image = image.convert("RGB")
+        regions = sam3_detect(image, prompt, conf_threshold=float(conf_thresh))
+    except ServerError as e:
+        raise gr.Error(f"SAM3 服务不可达：{e}")
+    except Exception as e:
+        raise gr.Error(f"检测过程出错：{e}")
 
-        model_inputs = SAM_PROCESSOR(
-            images=image,
-            text=prompt,
-            return_tensors="pt"
-        ).to(DEVICE)
+    if len(regions) == 0:
+        empty_json = {
+            "prompt": prompt,
+            "num_selected": 0,
+            "selected_regions": [],
+            "vl_reason": "SAM3 未找到任何候选区域。"
+        }
+        return image, image, json.dumps(empty_json, indent=2), "没有检测到任何目标。"
 
-        with torch.no_grad():
-            sam_outputs = SAM_MODEL(**model_inputs)
+    candidate_regions = [{
+        "region_index": r.region_index,
+        "bbox": r.bbox,
+        "score": r.score,
+        "mask": r.mask,
+        "label": prompt,
+    } for r in regions]
 
-        processed = SAM_PROCESSOR.post_process_instance_segmentation(
-            sam_outputs,
-            threshold=float(conf_thresh),
-            mask_threshold=0.5,
-            target_sizes=model_inputs.get("original_sizes").tolist()
-        )[0]
+    sam3_vis = annotate_sam3_candidates(
+        image,
+        [r["bbox"] for r in candidate_regions],
+        [r["score"] for r in candidate_regions],
+        [r["mask"] for r in candidate_regions],
+    )
 
-        raw_masks = processed.get("masks", None)
-        raw_scores = processed.get("scores", None)
-
-        if raw_masks is None or raw_scores is None or len(raw_scores) == 0:
-            empty_json = {
-                "prompt": prompt,
-                "num_selected": 0,
-                "selected_regions": [],
-                "vl_reason": "SAM3 found no candidate regions."
-            }
-            return image, image, json.dumps(empty_json, indent=2), "No detections found."
-
-        raw_masks_np = raw_masks.detach().cpu().numpy()
-        raw_scores_np = raw_scores.detach().cpu().numpy()
-
-        h, w = image.size[1], image.size[0]
-        candidate_regions = []
-
-        for idx, mask in enumerate(raw_masks_np):
-            if mask.ndim == 3:
-                mask = np.squeeze(mask, axis=0)
-            ys, xs = np.where(mask > 0)
-            if len(xs) == 0 or len(ys) == 0:
-                continue
-
-            x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-            bbox = clamp_box_xyxy([x1, y1, x2, y2], w, h)
-
-            candidate_regions.append({
-                "region_index": len(candidate_regions),
-                "bbox": bbox,
-                "score": float(raw_scores_np[idx]),
-                "mask": mask,
-                "label": prompt,
-            })
-
-        if len(candidate_regions) == 0:
-            empty_json = {
-                "prompt": prompt,
-                "num_selected": 0,
-                "selected_regions": [],
-                "vl_reason": "SAM3 masks were empty after post-processing."
-            }
-            return image, image, json.dumps(empty_json, indent=2), "No valid mask regions found."
-
-        sam3_vis = annotate_sam3_candidates(
-            image,
-            [r["bbox"] for r in candidate_regions],
-            [r["score"] for r in candidate_regions],
-            [r["mask"] for r in candidate_regions],
-        )
-
+    try:
         vl_result = qwen_filter_regions(image, candidate_regions, prompt)
-        selected_idx = vl_result.get("selected_region_indexes", [])
-        reason = vl_result.get("reason", "")
-
-        valid_idx = []
-        for idx in selected_idx:
-            try:
-                idx = int(idx)
-                if 0 <= idx < len(candidate_regions):
-                    valid_idx.append(idx)
-            except Exception:
-                continue
-
-        seen = set()
-        valid_idx = [x for x in valid_idx if not (x in seen or seen.add(x))]
-
-        selected_regions = [candidate_regions[i] for i in valid_idx]
-        final_vis = annotate_final_selection(image, selected_regions)
-        final_json = format_json_output(selected_regions, reason, prompt)
-
-        status = (
-            f"SAM3 proposed {len(candidate_regions)} region(s). "
-            f"{MODEL_VL} selected {len(selected_regions)} region(s)."
-        )
-
-        return sam3_vis, final_vis, json.dumps(final_json, indent=2), status
-
+    except ServerError as e:
+        raise gr.Error(f"VLM 服务不可达：{e}")
     except Exception as e:
-        raise gr.Error(f"Error during detection: {e}")
+        raise gr.Error(f"VLM 过滤过程出错：{e}")
+
+    selected_idx = vl_result.get("selected_region_indexes", [])
+    reason = vl_result.get("reason", "")
+
+    valid_idx = []
+    for idx in selected_idx:
+        try:
+            idx = int(idx)
+            if 0 <= idx < len(candidate_regions):
+                valid_idx.append(idx)
+        except Exception:
+            continue
+
+    seen = set()
+    valid_idx = [x for x in valid_idx if not (x in seen or seen.add(x))]
+
+    selected_regions = [candidate_regions[i] for i in valid_idx]
+    final_vis = annotate_final_selection(image, selected_regions)
+    final_json = format_json_output(selected_regions, reason, prompt)
+
+    status = (
+        f"SAM3 出 {len(candidate_regions)} 个候选区域，"
+        f"{MODEL_VL} 选中 {len(selected_regions)} 个。"
+    )
+
+    return sam3_vis, final_vis, json.dumps(final_json, indent=2), status
 
 
-@spaces.GPU(duration=calc_timeout_duration)
 def run_video_segmentation(video_path, prompt, frame_limit, time_limit):
-    if VID_MODEL is None or VID_PROCESSOR is None:
-        raise gr.Error("Video models failed to load on startup.")
-
     if not video_path:
-        raise gr.Error("Please upload a video.")
+        raise gr.Error("请先上传一个视频。")
     if not prompt or not prompt.strip():
-        raise gr.Error("Please provide a text prompt.")
+        raise gr.Error("请填写文本提示词。")
 
     try:
-        video_cap = cv2.VideoCapture(video_path)
-        vid_fps = video_cap.get(cv2.CAP_PROP_FPS)
-        if not vid_fps or vid_fps <= 0:
-            vid_fps = 24.0
-
-        vid_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vid_h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        video_frames = []
-        counter = 0
-        while video_cap.isOpened():
-            ret, frame = video_cap.read()
-            if not ret or (frame_limit > 0 and counter >= frame_limit):
-                break
-            video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            counter += 1
-        video_cap.release()
-
-        if len(video_frames) == 0:
-            return None, "No readable frames found in video."
-
-        session = VID_PROCESSOR.init_video_session(
-            video=video_frames,
-            inference_device=DEVICE,
-            dtype=torch.bfloat16
+        out_path, processed_frames, masked_frames = sam3_video(
+            video_path=video_path,
+            prompt=prompt,
+            frame_limit=int(frame_limit),
+            time_limit=int(time_limit),
+            render_mode="annotated",
         )
-        session = VID_PROCESSOR.add_text_prompt(
-            inference_session=session,
-            text=prompt
-        )
-
-        temp_out_path = tempfile.mktemp(suffix=".mp4")
-        video_writer = cv2.VideoWriter(
-            temp_out_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            vid_fps,
-            (vid_w, vid_h)
-        )
-
-        processed_frames = 0
-        annotated_frames = 0
-
-        for model_out in VID_MODEL.propagate_in_video_iterator(
-            inference_session=session,
-            max_frame_num_to_track=len(video_frames)
-        ):
-            post_processed = VID_PROCESSOR.postprocess_outputs(session, model_out)
-            f_idx = model_out.frame_idx
-
-            frame_rgb = video_frames[f_idx]
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            if "masks" in post_processed and post_processed["masks"] is not None:
-                detected_masks = post_processed["masks"]
-                if hasattr(detected_masks, "ndim") and detected_masks.ndim == 4:
-                    detected_masks = detected_masks.squeeze(1)
-
-                scores = post_processed.get("scores", None)
-                annotated_bgr = draw_video_masks_contours_and_boxes(
-                    frame_bgr=frame_bgr,
-                    mask_data=detected_masks,
-                    prompt_text=prompt,
-                    scores=scores,
-                )
-                if detected_masks is not None:
-                    annotated_frames += 1
-            else:
-                annotated_bgr = frame_bgr
-
-            video_writer.write(annotated_bgr)
-            processed_frames += 1
-
-        video_writer.release()
-
-        return (
-            temp_out_path,
-            f"Video processing completed successfully. Processed {processed_frames} frame(s). "
-            f"Annotated {annotated_frames} frame(s) with masks, contours, and bounding boxes."
-        )
-
+    except ServerError as e:
+        return None, f"SAM3 服务不可达：{e}"
     except Exception as e:
-        return None, f"Error during video processing: {str(e)}"
+        return None, f"视频处理出错：{str(e)}"
+
+    return (
+        out_path,
+        f"视频处理完成：共处理 {processed_frames} 帧，"
+        f"其中 {masked_frames} 帧带 mask、轮廓与边界框标注。"
+    )
 
 
-@spaces.GPU(duration=calc_timeout_duration)
 def run_video_segmentation_mask(video_path, prompt, frame_limit, time_limit):
-    if VID_MODEL is None or VID_PROCESSOR is None:
-        raise gr.Error("Video models failed to load on startup.")
-
     if not video_path:
-        raise gr.Error("Please upload a video.")
+        raise gr.Error("请先上传一个视频。")
     if not prompt or not prompt.strip():
-        raise gr.Error("Please provide a text prompt.")
+        raise gr.Error("请填写文本提示词。")
 
     try:
-        video_cap = cv2.VideoCapture(video_path)
-        vid_fps = video_cap.get(cv2.CAP_PROP_FPS)
-        if not vid_fps or vid_fps <= 0:
-            vid_fps = 24.0
-
-        vid_w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vid_h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        video_frames = []
-        counter = 0
-        while video_cap.isOpened():
-            ret, frame = video_cap.read()
-            if not ret or (frame_limit > 0 and counter >= frame_limit):
-                break
-            video_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            counter += 1
-        video_cap.release()
-
-        if len(video_frames) == 0:
-            return None, "No readable frames found in video."
-
-        session = VID_PROCESSOR.init_video_session(
-            video=video_frames,
-            inference_device=DEVICE,
-            dtype=torch.bfloat16
+        out_path, processed_frames, masked_frames = sam3_video(
+            video_path=video_path,
+            prompt=prompt,
+            frame_limit=int(frame_limit),
+            time_limit=int(time_limit),
+            render_mode="mask",
         )
-        session = VID_PROCESSOR.add_text_prompt(
-            inference_session=session,
-            text=prompt
-        )
-
-        temp_out_path = tempfile.mktemp(suffix=".mp4")
-        video_writer = cv2.VideoWriter(
-            temp_out_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            vid_fps,
-            (vid_w, vid_h)
-        )
-
-        processed_frames = 0
-        masked_frames = 0
-
-        for model_out in VID_MODEL.propagate_in_video_iterator(
-            inference_session=session,
-            max_frame_num_to_track=len(video_frames)
-        ):
-            post_processed = VID_PROCESSOR.postprocess_outputs(session, model_out)
-            f_idx = model_out.frame_idx
-
-            original_pil = Image.fromarray(video_frames[f_idx])
-
-            if "masks" in post_processed:
-                detected_masks = post_processed["masks"]
-                if hasattr(detected_masks, "ndim") and detected_masks.ndim == 4:
-                    detected_masks = detected_masks.squeeze(1)
-
-                final_frame = apply_mask_overlay(original_pil, detected_masks)
-                masked_frames += 1
-            else:
-                final_frame = original_pil
-
-            video_writer.write(cv2.cvtColor(np.array(final_frame), cv2.COLOR_RGB2BGR))
-            processed_frames += 1
-
-        video_writer.release()
-
-        return (
-            temp_out_path,
-            f"Video mask processing completed successfully. Processed {processed_frames} frame(s). "
-            f"Applied mask overlays to {masked_frames} frame(s)."
-        )
-
+    except ServerError as e:
+        return None, f"SAM3 服务不可达：{e}"
     except Exception as e:
-        return None, f"Error during video mask processing: {str(e)}"
+        return None, f"视频 mask 处理出错：{str(e)}"
+
+    return (
+        out_path,
+        f"视频 mask 处理完成：共处理 {processed_frames} 帧，"
+        f"其中 {masked_frames} 帧叠加了 mask。"
+    )
 
 
-@spaces.GPU
 def run_image_click_gpu(input_image, x, y, points_state, labels_state):
-    if TRK_MODEL is None or TRK_PROCESSOR is None:
-        raise gr.Error("Tracker model failed to load.")
-
     if input_image is None:
         return input_image, [], []
 
@@ -1038,34 +591,15 @@ def run_image_click_gpu(input_image, x, y, points_state, labels_state):
     if labels_state is None:
         labels_state = []
 
-    points_state.append([x, y])
+    points_state.append([int(x), int(y)])
     labels_state.append(1)
 
     try:
-        input_points = [[points_state]]
-        input_labels = [[labels_state]]
-
-        inputs = TRK_PROCESSOR(
-            images=input_image,
-            input_points=input_points,
-            input_labels=input_labels,
-            return_tensors="pt"
-        ).to(DEVICE)
-
-        with torch.no_grad():
-            outputs = TRK_MODEL(**inputs, multimask_output=False)
-
-        masks = TRK_PROCESSOR.post_process_masks(
-            outputs.pred_masks.cpu(),
-            inputs["original_sizes"],
-            binarize=True
-        )[0]
-
-        final_img = apply_mask_overlay(input_image, masks[0])
-        final_img = draw_points_on_image(final_img, points_state)
-
-        return final_img, points_state, labels_state
-
+        overlay, _has_mask = sam3_track(input_image, points_state, labels_state)
+        return overlay, points_state, labels_state
+    except ServerError as e:
+        print(f"Tracker service error: {e}")
+        return input_image, points_state, labels_state
     except Exception as e:
         print(f"Tracker Error: {e}")
         return input_image, points_state, labels_state
@@ -1076,61 +610,142 @@ def image_click_handler(image, evt: gr.SelectData, points_state, labels_state):
     return run_image_click_gpu(image, x, y, points_state, labels_state)
 
 
-@spaces.GPU
-def explain_detection(image, prompt, detection_json_text):
-    if VL_MODEL is None or VL_PROCESSOR is None:
-        raise gr.Error(f"{MODEL_VL} model failed to load.")
+# ---------- Image Q&A tab handlers ----------
+
+def _pil_to_data_url(image: Image.Image) -> str:
+    """Encode a PIL image as a `data:image/png;base64,...` URL for OpenAI image_url content."""
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def run_qa_detect_and_crop(image, prompt, conf_thresh):
+    """SAM3 detect → crop bbox per region → return gallery + crops state."""
     if image is None:
-        raise gr.Error("Please upload an image.")
+        raise gr.Error("请先上传一张图片。")
+    if not prompt or not prompt.strip():
+        raise gr.Error("请填写文本提示词。")
+
+    image = image.convert("RGB")
+
+    try:
+        regions = sam3_detect(image, prompt, conf_threshold=float(conf_thresh), return_masks=False)
+    except ServerError as e:
+        raise gr.Error(f"SAM3 服务不可达：{e}")
+
+    if len(regions) == 0:
+        return [], [], None, [], "没有检测到任何目标。"
+
+    crops: list[Image.Image] = []
+    captions: list[str] = []
+    for r in regions:
+        x1, y1, x2, y2 = r.bbox
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = image.crop((x1, y1, x2, y2))
+        crops.append(crop)
+        captions.append(f"#{r.region_index} score={r.score:.2f} bbox=({x1},{y1},{x2},{y2})")
+
+    gallery_value = list(zip(crops, captions))
+    status = f"SAM3 返回 {len(regions)} 个候选区域，已生成 {len(crops)} 张抠图。"
+    return gallery_value, crops, None, [], status
+
+
+def on_qa_gallery_select(evt: gr.SelectData, crops_state):
+    if crops_state is None or evt.index >= len(crops_state):
+        return None, None
+    return crops_state[evt.index], int(evt.index)
+
+
+def chat_with_qwen(message, history, selected_crop):
+    """Multi-turn streaming chat. Image only attached to the first turn."""
+    if selected_crop is None:
+        raise gr.Error("先在 Gallery 中点选一个候选子图。")
+    if not message or not message.strip():
+        return history, ""
+
+    history = history or []
+    img_data_url = _pil_to_data_url(selected_crop)
+
+    messages = []
+    for turn_idx, turn in enumerate(history):
+        if isinstance(turn, dict):
+            role, content = turn.get("role"), turn.get("content")
+        else:
+            role, content = turn[0], turn[1]
+        if turn_idx == 0 and role == "user":
+            messages.append({"role": "user", "content": [
+                {"type": "text", "text": content},
+                {"type": "image_url", "image_url": {"url": img_data_url}},
+            ]})
+        else:
+            messages.append({"role": role, "content": content})
+
+    if len(history) == 0:
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": message},
+            {"type": "image_url", "image_url": {"url": img_data_url}},
+        ]})
+    else:
+        messages.append({"role": "user", "content": message})
+
+    new_history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": ""},
+    ]
+    yield new_history, ""
+
+    partial = ""
+    try:
+        for chunk_text in vlm_chat_stream(messages, enable_thinking=True):
+            partial += chunk_text
+            new_history[-1] = {"role": "assistant", "content": partial}
+            yield new_history, ""
+    except ServerError as e:
+        new_history[-1] = {"role": "assistant", "content": partial + f"\n\n[VLM 错误：{e}]"}
+        yield new_history, ""
+
+
+def clear_qa_chat():
+    return [], ""
+
+
+def explain_detection(image, prompt, detection_json_text):
+    if image is None:
+        raise gr.Error("请先上传一张图片。")
     if not detection_json_text or not detection_json_text.strip():
-        raise gr.Error("Run detection first.")
+        raise gr.Error("请先运行检测。")
 
     image = image.convert("RGB")
     explain_prompt = f"""
-You are given an image, the original user prompt, and a JSON detection result.
+你将看到一张图片、原始的检测提示词，以及一段 JSON 形式的检测结果。
 
-Original user prompt:
+原始提示词：
 {prompt}
 
-Detection JSON:
+检测结果 JSON：
 {detection_json_text}
 
-Explain briefly:
-1. What object(s) were selected
-2. Why they match the prompt
-3. Whether the result seems reliable
+请用中文简要说明：
+1. 选中了哪些目标
+2. 为什么它们匹配提示词
+3. 这个结果是否可靠
 
-Keep the answer concise and readable.
+回答务必简洁清晰，控制在三段之内。
 """
 
-    inputs = build_vl_inputs(image, explain_prompt)
-
-    streamer = TextIteratorStreamer(
-        VL_PROCESSOR.tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=True,
-        timeout=120
-    )
-
-    thread = Thread(
-        target=VL_MODEL.generate,
-        kwargs=dict(
-            **inputs,
-            streamer=streamer,
-            max_new_tokens=512,
-            use_cache=True,
-            temperature=0.6,
-            do_sample=True,
-        )
-    )
-    thread.start()
-
     full_text = ""
-    for token in streamer:
-        full_text += token
-        yield full_text
-
-    thread.join()
+    try:
+        for chunk in vlm_generate_stream(
+            image,
+            explain_prompt,
+            max_new_tokens=512,
+            temperature=0.6,
+        ):
+            full_text += chunk
+            yield full_text
+    except ServerError as e:
+        raise gr.Error(f"VLM 服务不可达：{e}")
 
 
 def html_header():
@@ -1139,15 +754,15 @@ def html_header():
         <div class="header-content">
             <div class="header-icon-wrap">{T_LOGO_SVG}</div>
             <div class="header-text">
-                <h1>SAM3 + Gemma 4 — Image & Video Segmentation</h1>
+                <h1>SAM3 + Qwen — 图像与视频分割</h1>
                 <div class="header-meta">
-                    <span class="meta-badge">{SVG_CHIP} {SAM_MODEL_NAME}</span>
+                    <span class="meta-badge">{SVG_CHIP} SAM3 服务 @ {SAM3_SERVER_URL}</span>
                     <span class="meta-sep"></span>
-                    <span class="meta-cap">SAM3 Proposals</span>
+                    <span class="meta-cap">SAM3 候选区域</span>
                     <span class="meta-sep"></span>
-                    <span class="meta-cap">Gemma 4 Filtering</span>
+                    <span class="meta-cap">Qwen 过滤</span>
                     <span class="meta-sep"></span>
-                    <span class="meta-cap">Image + Video Segmentation </span>
+                    <span class="meta-cap">图像 + 视频分割</span>
                 </div>
             </div>
         </div>
@@ -1210,83 +825,83 @@ with gr.Blocks() as demo:
     gr.HTML(html_header())
 
     with gr.Tabs():
-        with gr.Tab("Image Detection (*Filter)"):
+        with gr.Tab("图像检测（带过滤）"):
             gr.HTML(html_tab_intro(
                 SVG_IMAGE,
-                "Image Detection with SAM3 + Gemma 4",
-                "SAM3 first proposes candidate masks and regions from your text prompt. Gemma 4 then filters those candidates and keeps only the regions that best match the request.",
-                "Image mode: SAM3 proposes regions, Gemma 4 filters final detections.",
+                "SAM3 + Qwen 图像检测",
+                "SAM3 先根据你的文本提示输出候选 mask 和区域。Qwen 再对这些候选做过滤，只保留最匹配你描述的那些。",
+                "图像模式：SAM3 出候选，Qwen 过滤最终结果。",
             ))
 
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.HTML(html_card_label(SVG_IMAGE, "Input"))
-                    image_input = gr.Image(type="pil", label="Upload Image", height=360)
+                    gr.HTML(html_card_label(SVG_IMAGE, "输入"))
+                    image_input = gr.Image(type="pil", label="上传图片", height=360)
 
                     prompt_input = gr.Textbox(
-                        label="Detection Prompt",
-                        placeholder="e.g., person wearing a black top",
+                        label="检测提示词",
+                        placeholder="例如：穿黑色上衣的人",
                         lines=2,
                     )
 
-                    with gr.Accordion("Advanced Settings", open=False):
+                    with gr.Accordion("高级设置", open=False):
                         conf_slider = gr.Slider(
                             minimum=0.0,
                             maximum=1.0,
                             value=0.45,
                             step=0.05,
-                            label="SAM3 Confidence Threshold",
+                            label="SAM3 置信度阈值",
                         )
 
-                    detect_btn = gr.Button("Run SAM3 + Gemma 4 Detection", variant="primary")
-                    explain_btn = gr.Button("Explain Result", variant="secondary")
+                    detect_btn = gr.Button("运行 SAM3 + Qwen 检测", variant="primary")
+                    explain_btn = gr.Button("解释结果", variant="secondary")
 
                     gr.HTML(html_divider())
 
                     gr.Examples(
                         examples=EXAMPLES,
                         inputs=[image_input, prompt_input, conf_slider],
-                        label="Examples",
+                        label="示例",
                     )
 
                 with gr.Column(scale=1):
-                    gr.HTML(html_section_heading(SVG_DETECT, "SAM3 Candidate Proposals"))
-                    sam3_output = gr.Image(label="SAM3 Result", height=300)
+                    gr.HTML(html_section_heading(SVG_DETECT, "SAM3 候选区域"))
+                    sam3_output = gr.Image(label="SAM3 结果", height=300)
 
-                    gr.HTML(html_section_heading(SVG_OUTPUT, "Final Gemma-Filtered Detection"))
-                    final_output = gr.Image(label="SAM3 + Gemma 4 Result", height=300)
+                    gr.HTML(html_section_heading(SVG_OUTPUT, "Qwen 过滤后的最终检测"))
+                    final_output = gr.Image(label="SAM3 + Qwen 结果", height=300)
 
                     gr.Markdown(
                         f"""
-                        ### How to Use
-                    
-                        #### 1. Upload & Prompt
-                        - Upload an image you want to analyze & Enter a clear detection prompt.
-                    
-                        #### 2. Adjust SAM3 Settings
-                        - Use the **confidence threshold slider** to control how strict SAM3 is:
-                          - **Lower values** → more regions, **Higher values** → fewer, cleaner regions
-                    
-                        #### 3. Run Detection & Explain
-                        - Click **"Run SAM3 + Gemma 4 Detection"**
-                        - **Top Panel:** Candidate regions, **Bottom Panel:** Final filtered detections (Gemma 4)
-                        - **JSON Output:** Structured results including bounding boxes, scores, and labels
-                        - Click **"Explain Result"** to get a natural language explanation
+                        ### 使用步骤
+
+                        #### 1. 上传图片 + 写提示词
+                        - 上传你要分析的图片，写一句清晰的检测描述。
+
+                        #### 2. 调整 SAM3 设置
+                        - 用 **置信度阈值滑块** 控制 SAM3 的严格程度：
+                          - **值越低** → 候选越多，**值越高** → 候选越少越干净。
+
+                        #### 3. 运行检测与解释
+                        - 点 **"运行 SAM3 + Qwen 检测"**
+                        - **上方面板：** SAM3 候选区域，**下方面板：** Qwen 过滤后的最终检测
+                        - **JSON 输出：** 结构化结果，含 bbox、score、label
+                        - 点 **"解释结果"** 让 Qwen 用自然语言说明为什么这么选
                         """
                     )
 
                 with gr.Column(scale=1):
-                    gr.HTML(html_section_heading(SVG_TEXT, "Structured Output"))
-                    json_output = gr.Textbox(label="Detection JSON", lines=18, interactive=True)
+                    gr.HTML(html_section_heading(SVG_TEXT, "结构化输出"))
+                    json_output = gr.Textbox(label="检测结果 JSON", lines=18, interactive=True)
 
-                    status_output = gr.Textbox(label="System Status", interactive=False)
+                    status_output = gr.Textbox(label="系统状态", interactive=False)
 
                     gr.HTML(html_status_indicator(
-                        "Pipeline: SAM3 proposes regions → Gemma 4 filters relevant detections."
+                        "流水线：SAM3 出候选 → Qwen 过滤相关检测。"
                     ))
 
-                    gr.HTML(html_section_heading(SVG_TEXT, "Gemma Explanation"))
-                    explanation_output = gr.Textbox(label="Explanation", lines=15, interactive=True)
+                    gr.HTML(html_section_heading(SVG_TEXT, "Qwen 解释"))
+                    explanation_output = gr.Textbox(label="解释", lines=15, interactive=True)
 
             detect_btn.click(
                 fn=run_sam3_qwen_detection,
@@ -1300,58 +915,58 @@ with gr.Blocks() as demo:
                 outputs=[explanation_output],
             )
 
-        with gr.Tab("Video Segmentation (*Mask)"):
+        with gr.Tab("视频分割（纯 mask）"):
             gr.HTML(html_tab_intro(
                 SVG_VIDEO,
-                "Video Segmentation with SAM3 Mask Overlay",
-                "Segment objects across video frames using a text prompt and render pure colored mask overlays directly on the original frames.",
-                "Video mode: text-prompted segmentation with mask overlays only.",
+                "SAM3 视频分割（mask 叠加）",
+                "用文本提示在视频每一帧里分割目标物体，仅在原始帧上渲染彩色 mask 叠加层。",
+                "视频模式：文本提示分割，仅显示 mask 叠加。",
             ))
 
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.HTML(html_card_label(SVG_VIDEO, "Video Input"))
-                    video_input_mask = gr.Video(label="Upload Video", format="mp4", height=320)
+                    gr.HTML(html_card_label(SVG_VIDEO, "视频输入"))
+                    video_input_mask = gr.Video(label="上传视频", format="mp4", height=320)
 
                     video_prompt_mask = gr.Textbox(
-                        label="Segmentation Prompt",
-                        placeholder="e.g., players, person running, red car",
+                        label="分割提示词",
+                        placeholder="例如：球员、跑动的人、红色汽车",
                         lines=2,
                     )
 
-                    with gr.Accordion("Advanced Settings", open=False):
+                    with gr.Accordion("高级设置", open=False):
                         with gr.Row():
                             frame_limiter_mask = gr.Slider(
                                 minimum=10,
                                 maximum=1000,
                                 value=60,
                                 step=10,
-                                label="Max Frames",
+                                label="最大帧数",
                             )
                             time_limiter_mask = gr.Radio(
                                 choices=[60, 120, 180, 240, 300],
                                 value=60,
-                                label="Timeout (seconds)",
+                                label="超时（秒）",
                             )
 
-                    video_btn_mask = gr.Button("Run Video Mask Segmentation", variant="primary")
+                    video_btn_mask = gr.Button("运行视频 mask 分割", variant="primary")
 
                     gr.HTML(html_divider())
 
                     gr.Examples(
                         examples=VIDEO_EXAMPLES,
                         inputs=[video_input_mask, video_prompt_mask, frame_limiter_mask, time_limiter_mask],
-                        label="Video Examples",
+                        label="视频示例",
                     )
 
                 with gr.Column(scale=1):
-                    gr.HTML(html_section_heading(SVG_OUTPUT, "Processed Video"))
-                    video_output_mask = gr.Video(label="Masked Video", height=420)
+                    gr.HTML(html_section_heading(SVG_OUTPUT, "处理后视频"))
+                    video_output_mask = gr.Video(label="带 mask 的视频", height=420)
 
-                    video_status_mask = gr.Textbox(label="System Status", interactive=False)
+                    video_status_mask = gr.Textbox(label="系统状态", interactive=False)
 
                     gr.HTML(html_status_indicator(
-                        "Pipeline: SAM3 video session → prompt conditioning → mask propagation with overlay rendering."
+                        "流水线：SAM3 视频 session → 提示词条件化 → mask 在帧间传播并叠加渲染。"
                     ))
 
             video_btn_mask.click(
@@ -1360,58 +975,58 @@ with gr.Blocks() as demo:
                 outputs=[video_output_mask, video_status_mask],
             )
 
-        with gr.Tab("Video Segmentation (*Annotated)"):
+        with gr.Tab("视频分割（带标注）"):
             gr.HTML(html_tab_intro(
                 SVG_VIDEO,
-                "Video Segmentation with SAM3",
-                "Segment objects across video frames using a text prompt. The SAM3 video model initializes a video session and propagates segmentation masks through the clip.",
-                "Video mode: text-prompted segmentation over tracked frames with masks, contours, and bounding boxes.",
+                "SAM3 视频分割",
+                "用文本提示在视频帧间分割目标物体。SAM3 视频模型初始化一个视频 session，然后把分割 mask 在整段视频里传播。",
+                "视频模式：文本提示分割，输出带 mask、轮廓与边界框。",
             ))
 
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.HTML(html_card_label(SVG_VIDEO, "Video Input"))
-                    video_input = gr.Video(label="Upload Video", format="mp4", height=320)
+                    gr.HTML(html_card_label(SVG_VIDEO, "视频输入"))
+                    video_input = gr.Video(label="上传视频", format="mp4", height=320)
 
                     video_prompt = gr.Textbox(
-                        label="Segmentation Prompt",
-                        placeholder="e.g., players, person running, red car",
+                        label="分割提示词",
+                        placeholder="例如：球员、跑动的人、红色汽车",
                         lines=2,
                     )
 
-                    with gr.Accordion("Advanced Settings", open=False):
+                    with gr.Accordion("高级设置", open=False):
                         with gr.Row():
                             frame_limiter = gr.Slider(
                                 minimum=10,
                                 maximum=1000,
                                 value=60,
                                 step=10,
-                                label="Max Frames",
+                                label="最大帧数",
                             )
                             time_limiter = gr.Radio(
                                 choices=[60, 120, 180, 240, 300],
                                 value=60,
-                                label="Timeout (seconds)",
+                                label="超时（秒）",
                             )
 
-                    video_btn = gr.Button("Run Video Segmentation", variant="primary")
+                    video_btn = gr.Button("运行视频分割", variant="primary")
 
                     gr.HTML(html_divider())
 
                     gr.Examples(
                         examples=VIDEO_EXAMPLES,
                         inputs=[video_input, video_prompt, frame_limiter, time_limiter],
-                        label="Video Examples",
+                        label="视频示例",
                     )
 
                 with gr.Column(scale=1):
-                    gr.HTML(html_section_heading(SVG_OUTPUT, "Processed Video"))
-                    video_output = gr.Video(label="Segmented Video", height=420)
+                    gr.HTML(html_section_heading(SVG_OUTPUT, "处理后视频"))
+                    video_output = gr.Video(label="分割视频", height=420)
 
-                    video_status = gr.Textbox(label="System Status", interactive=False)
+                    video_status = gr.Textbox(label="系统状态", interactive=False)
 
                     gr.HTML(html_status_indicator(
-                        "Pipeline: SAM3 video session → prompt conditioning → mask propagation with contours and bounding boxes."
+                        "流水线：SAM3 视频 session → 提示词条件化 → mask 在帧间传播，输出含轮廓与边界框。"
                     ))
 
             video_btn.click(
@@ -1420,41 +1035,41 @@ with gr.Blocks() as demo:
                 outputs=[video_output, video_status],
             )
 
-        with gr.Tab("Image Click Segmentation"):
+        with gr.Tab("点选分割"):
             gr.HTML(html_tab_intro(
                 SVG_IMAGE,
-                "Interactive Click Segmentation with SAM3 Tracker",
-                "Upload an image and click on the object you want to segment. Each click is treated as a positive foreground point and the tracker model updates the mask preview.",
-                "Interactive mode: click-to-segment with cumulative positive points.",
+                "SAM3 Tracker 交互式点选分割",
+                "上传图片，然后在你想分割的物体上点击。每次点击都被当作一个前景点累加，tracker 模型会实时更新 mask 预览。",
+                "交互模式：累计前景点点击式分割。",
             ))
 
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.HTML(html_card_label(SVG_IMAGE, "Interactive Input"))
+                    gr.HTML(html_card_label(SVG_IMAGE, "交互输入"))
                     img_click_input = gr.Image(
                         type="pil",
-                        label="Upload Image",
+                        label="上传图片",
                         interactive=True,
                         height=450
                     )
 
                     with gr.Row():
-                        img_click_clear = gr.Button("Clear Points & Reset", variant="primary")
+                        img_click_clear = gr.Button("清空点位并重置", variant="primary")
 
                     st_click_points = gr.State([])
                     st_click_labels = gr.State([])
 
                 with gr.Column(scale=1):
-                    gr.HTML(html_section_heading(SVG_OUTPUT, "Result Preview"))
+                    gr.HTML(html_section_heading(SVG_OUTPUT, "结果预览"))
                     img_click_output = gr.Image(
                         type="pil",
-                        label="Segmented Preview",
+                        label="分割预览",
                         height=450,
                         interactive=False
                     )
 
                     gr.HTML(html_status_indicator(
-                        "Pipeline: click points → SAM3 tracker prompt encoding → mask prediction overlay."
+                        "流水线：点击坐标 → SAM3 tracker 提示编码 → mask 预测叠加。"
                     ))
 
             img_click_input.select(
@@ -1468,9 +1083,110 @@ with gr.Blocks() as demo:
                 outputs=[img_click_output, st_click_points, st_click_labels]
             )
 
+        with gr.Tab("图像问答（抠图 + 聊天）"):
+            gr.HTML(html_tab_intro(
+                SVG_TEXT,
+                "图像问答 —— SAM3 抠图 + Qwen 对话",
+                "上传一张图和一句提示词，SAM3 会检测出所有候选区域并裁剪出来。在 Gallery 里点选一张，再针对它跟 Qwen 3.6 27B 聊天提问。",
+                f"VLM 端点：{QWEN_BASE_URL} • 模型：{QWEN_MODEL}",
+            ))
+
+            qa_crops_state = gr.State([])
+            qa_selected_crop = gr.State(None)
+            qa_selected_idx = gr.State(None)
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.HTML(html_card_label(SVG_IMAGE, "输入"))
+                    qa_image_input = gr.Image(type="pil", label="上传图片", height=320)
+                    qa_prompt_input = gr.Textbox(
+                        label="检测提示词",
+                        placeholder="例如：人、人脸、汽车",
+                        lines=2,
+                    )
+                    with gr.Accordion("高级设置", open=False):
+                        qa_conf_slider = gr.Slider(
+                            minimum=0.0, maximum=1.0, value=0.45, step=0.05,
+                            label="SAM3 置信度阈值",
+                        )
+                    qa_detect_btn = gr.Button("检测并抠图", variant="primary")
+                    qa_status = gr.Textbox(label="状态", interactive=False)
+
+                    gr.Examples(
+                        examples=EXAMPLES,
+                        inputs=[qa_image_input, qa_prompt_input, qa_conf_slider],
+                        label="示例",
+                    )
+
+                with gr.Column(scale=1):
+                    gr.HTML(html_section_heading(SVG_DETECT, "候选抠图"))
+                    qa_gallery = gr.Gallery(
+                        label="点选其中一张开始对话",
+                        columns=3,
+                        height=520,
+                        object_fit="contain",
+                        show_label=True,
+                    )
+
+                with gr.Column(scale=1):
+                    gr.HTML(html_section_heading(SVG_OUTPUT, "当前选中"))
+                    qa_selected_preview = gr.Image(
+                        label="当前选中子图",
+                        type="pil",
+                        height=240,
+                        interactive=False,
+                    )
+                    gr.HTML(html_section_heading(SVG_TEXT, "与 Qwen 对话"))
+                    qa_chatbot = gr.Chatbot(
+                        label="Qwen",
+                        height=320,
+                    )
+                    with gr.Row():
+                        qa_message = gr.Textbox(
+                            placeholder="对选中的子图问点什么……",
+                            show_label=False,
+                            scale=4,
+                        )
+                        qa_send = gr.Button("发送", variant="primary", scale=1)
+                    qa_clear = gr.Button("清空对话", variant="secondary")
+
+            qa_detect_btn.click(
+                fn=run_qa_detect_and_crop,
+                inputs=[qa_image_input, qa_prompt_input, qa_conf_slider],
+                outputs=[qa_gallery, qa_crops_state, qa_selected_preview, qa_chatbot, qa_status],
+            )
+
+            qa_gallery.select(
+                fn=on_qa_gallery_select,
+                inputs=[qa_crops_state],
+                outputs=[qa_selected_preview, qa_selected_idx],
+            ).then(
+                fn=lambda crop: crop,
+                inputs=[qa_selected_preview],
+                outputs=[qa_selected_crop],
+            )
+
+            qa_send.click(
+                fn=chat_with_qwen,
+                inputs=[qa_message, qa_chatbot, qa_selected_crop],
+                outputs=[qa_chatbot, qa_message],
+            )
+            qa_message.submit(
+                fn=chat_with_qwen,
+                inputs=[qa_message, qa_chatbot, qa_selected_crop],
+                outputs=[qa_chatbot, qa_message],
+            )
+
+            qa_clear.click(
+                fn=clear_qa_chat,
+                outputs=[qa_chatbot, qa_message],
+            )
+
 
 if __name__ == "__main__":
     demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
         css=css,
         mcp_server=True,
         theme=steel_blue_theme,

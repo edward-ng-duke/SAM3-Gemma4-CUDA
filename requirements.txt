@@ -22,3 +22,7 @@ kernels
 requests
 av
 hf_xet
+fastapi
+uvicorn[standard]
+httpx
+openai>=1.40.0

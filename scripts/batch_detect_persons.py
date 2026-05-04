@@ -58,48 +58,27 @@ def _clamp_box_xyxy(box, width, height):
     return [x1, y1, x2, y2]
 
 
-def detect_with_prompt(image_pil, prompt, conf_thresh, sam_model, sam_processor, device):
-    import torch
-    import numpy as np
+def detect_with_prompt(image_pil, prompt, conf_thresh):
+    """Single-prompt detection via the SAM3 stateless service (servers.py)."""
+    from servers_client import sam3_detect
 
-    model_inputs = sam_processor(images=image_pil, text=prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        sam_outputs = sam_model(**model_inputs)
-    processed = sam_processor.post_process_instance_segmentation(
-        sam_outputs,
-        threshold=float(conf_thresh),
-        mask_threshold=0.5,
-        target_sizes=model_inputs.get("original_sizes").tolist(),
-    )[0]
-    raw_masks = processed.get("masks", None)
-    raw_scores = processed.get("scores", None)
-    if raw_masks is None or raw_scores is None or len(raw_scores) == 0:
-        return []
-    raw_masks_np = raw_masks.detach().cpu().numpy()
-    raw_scores_np = raw_scores.detach().cpu().numpy()
-    w, h = image_pil.size[0], image_pil.size[1]
+    regions = sam3_detect(image_pil, prompt, conf_threshold=float(conf_thresh))
     out = []
-    for idx, mask in enumerate(raw_masks_np):
-        if mask.ndim == 3:
-            mask = np.squeeze(mask, axis=0)
-        ys, xs = np.where(mask > 0)
-        if len(xs) == 0 or len(ys) == 0:
-            continue
-        bbox = _clamp_box_xyxy([xs.min(), ys.min(), xs.max(), ys.max()], w, h)
+    for r in regions:
         out.append({
             "prompt": prompt,
-            "bbox": bbox,
-            "score": float(raw_scores_np[idx]),
-            "mask": mask,
+            "bbox": r.bbox,
+            "score": r.score,
+            "mask": r.mask,
         })
     return out
 
 
-def collect_all_detections(image_pil, prompts, conf_thresh, sam_model, sam_processor, device):
+def collect_all_detections(image_pil, prompts, conf_thresh):
     regions = []
     per_prompt_counts = {}
     for prompt in prompts:
-        got = detect_with_prompt(image_pil, prompt, conf_thresh, sam_model, sam_processor, device)
+        got = detect_with_prompt(image_pil, prompt, conf_thresh)
         per_prompt_counts[prompt] = len(got)
         regions.extend(got)
     for i, region in enumerate(regions):
@@ -111,8 +90,7 @@ def cluster_persons_with_gemma(image_pil, regions):
     if len(regions) == 0:
         return {"num_persons": 0, "reasoning": "no regions to cluster", "persons": []}
 
-    import torch
-    from app import VL_MODEL, VL_PROCESSOR, build_vl_inputs, safe_parse_json
+    from servers_client import vlm_generate, safe_parse_json
 
     regions_for_prompt = [{k: v for k, v in r.items() if k != "mask"} for r in regions]
     regions_json = json.dumps(regions_for_prompt, indent=2)
@@ -141,19 +119,13 @@ def cluster_persons_with_gemma(image_pil, regions):
         " \"persons\": [{\"person_id\": <int>, \"region_indexes\": [<int>, ...]}]}"
     )
 
-    inputs = build_vl_inputs(image_pil, instruction)
-    with torch.inference_mode():
-        gen_ids = VL_MODEL.generate(
-            **inputs,
-            max_new_tokens=768,
-            use_cache=True,
-            temperature=0.2,
-            do_sample=False,
-        )
-    raw = VL_PROCESSOR.batch_decode(
-        gen_ids[:, inputs["input_ids"].shape[1]:],
-        skip_special_tokens=True,
-    )[0].strip()
+    raw = vlm_generate(
+        image_pil,
+        instruction,
+        max_new_tokens=768,
+        temperature=0.2,
+        enable_thinking=False,
+    )
 
     try:
         parsed = safe_parse_json(raw)
@@ -319,7 +291,7 @@ def visualize_sam_raw(image_pil, regions):
     return composed
 
 
-def process_image(image_path, out_dir, conf_thresh, sam_model, sam_processor, vl_model, vl_processor, device):
+def process_image(image_path, out_dir, conf_thresh):
     from PIL import Image
 
     json_dir = os.path.join(out_dir, "json")
@@ -336,7 +308,7 @@ def process_image(image_path, out_dir, conf_thresh, sam_model, sam_processor, vl
         image_pil = Image.open(image_path).convert("RGB")
 
         regions, per_prompt_counts = collect_all_detections(
-            image_pil, PROMPTS, conf_thresh, sam_model, sam_processor, device
+            image_pil, PROMPTS, conf_thresh
         )
 
         if len(regions) == 0:
@@ -453,8 +425,20 @@ def main():
         print(f"No images in {input_dir} (looked for {IMAGE_EXTS})")
         return
 
-    from app import SAM_MODEL, SAM_PROCESSOR, VL_MODEL, VL_PROCESSOR, DEVICE
-    print("Models loaded.")
+    # Verify SAM3 service is up. VLM is the external Qwen endpoint and is checked at first call.
+    from servers_client import health as sam3_health, ServerError, QWEN_BASE_URL, QWEN_MODEL
+    try:
+        h = sam3_health()
+        print(f"SAM3 service: {h}")
+    except ServerError as e:
+        print(f"FATAL: SAM3 service not reachable at servers.py. Start it with `make serve`. Error: {e}")
+        return
+    loaded = h.get("models_loaded", {})
+    if not loaded.get("sam3_image"):
+        print(f"FATAL: SAM3 image model not loaded: {loaded}")
+        return
+    print(f"VLM (Qwen) endpoint: {QWEN_BASE_URL} model={QWEN_MODEL}")
+    print("This script holds no model weights.")
 
     N = len(entries)
     ok_count = 0
@@ -478,10 +462,7 @@ def main():
                 pass
 
         t0 = time.time()
-        result = process_image(
-            path, output_dir, args.conf_thresh,
-            SAM_MODEL, SAM_PROCESSOR, VL_MODEL, VL_PROCESSOR, DEVICE,
-        )
+        result = process_image(path, output_dir, args.conf_thresh)
         elapsed = time.time() - t0
 
         if result.get("status") == "ok":
