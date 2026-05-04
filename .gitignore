@@ -1,0 +1,10 @@
+.venv/
+models/
+.env
+.env.docker
+.claude/
+*.local.json
+followups.md
+__pycache__/
+*.pyc
+.DS_Store
