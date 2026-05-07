@@ -34,7 +34,7 @@
 
 ## 验证结论
 
-已确认 accessible 数量 ≥ 3: YES (count = 14: D1, D2, D2b, D2c, D3, D3b, D4, D4b, D4c, D5, D5b, D5c, D9, D10, D11 — D11 borderline)
+已确认 accessible 数量 ≥ 3: YES — 14 fully verified + 1 borderline (D11) = 15 listed. Verified IDs: D1, D2, D2b, D2c, D3, D3b, D4, D4b, D4c, D5, D5b, D5c, D9, D10. Borderline: D11.
 
 ## 备注
 
