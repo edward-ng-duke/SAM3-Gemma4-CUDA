@@ -15,7 +15,8 @@ DATA_DIR ?= /home/edward/research/lianzhong-project/data/反向教学教材
 OUT_DIR  ?= /home/edward/research/lianzhong-project/data/outputs/反向教学教材
 
 .PHONY: help dev dev-orchestrate run serve venv install models gemma-model download clean-venv clean-models status stop detect report \
-        docker-build docker-up docker-down docker-logs docker-restart docker-clean docker-shell
+        docker-build docker-up docker-down docker-logs docker-restart docker-clean docker-shell \
+        eval-blade
 
 help:
 	@echo "Targets:"
@@ -174,3 +175,14 @@ clean-venv:
 
 clean-models:
 	rm -rf models
+
+# ---------- blade defect evaluation ----------
+# Usage: make eval-blade DATASET=<path> PREDICTOR=dummy OUT=<path>
+PREDICTOR ?= dummy
+
+eval-blade:
+	@if [ -z "$(DATASET)" ] || [ -z "$(OUT)" ]; then \
+		echo "Usage: make eval-blade DATASET=<path> PREDICTOR=dummy OUT=<path>"; \
+		exit 2; \
+	fi
+	$(PY) -m scripts.blade --dataset "$(DATASET)" --predictor "$(PREDICTOR)" --out "$(OUT)"
