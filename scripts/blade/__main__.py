@@ -61,14 +61,13 @@ def _predictor_registry() -> dict[str, Callable[[], object]]:
 
     Factories are used (rather than instances) so that constructing a
     predictor only happens for the one actually selected on the CLI.
-    T13 will extend this with ``'baseline'``; for T9 we only register
-    ``'dummy'``.
     """
 
-    from .predictors import DummyPredictor
+    from .predictors import BaselineSAM3VLMPredictor, DummyPredictor
 
     return {
         "dummy": lambda: DummyPredictor(),
+        "baseline": lambda: BaselineSAM3VLMPredictor(),
     }
 
 
