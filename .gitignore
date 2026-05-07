@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .playwright-mcp/
+.coverage
+data/blade_eval/
+reports/blade/
