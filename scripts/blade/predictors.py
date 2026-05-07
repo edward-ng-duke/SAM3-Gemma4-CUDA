@@ -43,3 +43,24 @@ class Predictor(Protocol):
     def predict(self, image_path: Path, record: BladeRecord) -> Prediction:
         """Run prediction on a single image and return a Prediction dict."""
         ...
+
+
+class DummyPredictor:
+    """Baseline predictor that always reports no defect.
+
+    Useful as a sanity-check predictor for the evaluation pipeline: every
+    image is predicted as defect-free with zero confidence, so downstream
+    metrics reflect only the dataset's class prior.
+    """
+
+    def predict(self, image_path: Path, record: BladeRecord) -> Prediction:
+        """Return a constant Prediction indicating no defect detected."""
+        return {
+            "has_defect": False,
+            "defect_type": "none",
+            "severity": "none",
+            "evidence": "dummy predictor: always reports no defect",
+            "confidence": 0.0,
+            "bbox": None,
+            "raw": {},
+        }
