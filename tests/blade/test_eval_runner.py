@@ -88,3 +88,26 @@ def test_run_eval_creates_output_dir(tmp_path: Path) -> None:
     assert (nested / "predictions.jsonl").is_file()
     assert (nested / "metrics.yaml").is_file()
     assert isinstance(metrics, dict)
+
+
+def test_render_report_creates_html(tmp_path: Path) -> None:
+    """render_report builds a single-page HTML with metrics + failure gallery."""
+    from scripts.blade.report import render_report
+
+    loader = RoboflowYoloLoader(FIXTURE_ROOT)
+    metrics = run_eval(loader, DummyPredictor(), tmp_path)
+
+    predictions_jsonl = tmp_path / "predictions.jsonl"
+    image_root = FIXTURE_ROOT / "images"
+    output_html = tmp_path / "report.html"
+
+    returned = render_report(metrics, predictions_jsonl, image_root, output_html)
+
+    assert Path(returned) == output_html
+    assert output_html.is_file()
+    assert output_html.stat().st_size > 1024
+    content = output_html.read_text(encoding="utf-8")
+    assert "<table" in content
+    assert "Metrics Summary" in content
+    # The dataset name (mini_dataset, derived from fixture root) should appear.
+    assert "mini_dataset" in content
