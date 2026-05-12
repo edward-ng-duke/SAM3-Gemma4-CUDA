@@ -22,16 +22,22 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import base64
+import hashlib
 import io
+import logging
+import logging.handlers
 import tempfile
 import threading
-from typing import Optional
+import traceback
+from typing import Any, Optional
 
 import cv2
 import numpy as np
 import torch
+import transformers
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw
 from pydantic import BaseModel
 from safetensors.torch import load_file as load_safetensors
@@ -81,6 +87,48 @@ TRK_MODEL: Optional[Sam3TrackerModel] = None
 TRK_PROCESSOR: Optional[Sam3TrackerProcessor] = None
 VID_MODEL: Optional[Sam3VideoModel] = None
 VID_PROCESSOR: Optional[Sam3VideoProcessor] = None
+
+# Populated at startup by _load_models(); cached so /health and /v1/sam3/config stay O(1).
+MODEL_META: dict[str, Any] = {}
+
+LOG_DIR = os.environ.get("SAM3_LOG_DIR", os.path.join(_HERE, "logs"))
+LOG_PATH = os.path.join(LOG_DIR, "sam3_server.log")
+
+logger = logging.getLogger("sam3.server")
+
+
+def _setup_logging() -> None:
+    if logger.handlers:
+        return
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_PATH, maxBytes=50 * 1024 * 1024, backupCount=5
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except OSError as e:
+        # Log dir not writable (rare; e.g., read-only container fs). Stream-only logging
+        # still works for journalctl / docker logs, so don't crash startup.
+        print(f"[servers] WARN: rotating file log disabled ({e}); using stderr only")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    logger.propagate = False
+
+
+_setup_logging()
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """torch raises OutOfMemoryError on newer versions; older versions raise RuntimeError
+    whose message contains 'out of memory'."""
+    oom_cls = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(exc, oom_cls):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
 def _load_models():
@@ -134,6 +182,50 @@ def _load_models():
     # 4) 健全性自检：vision_encoder 内存里只有 1 份（id 相同）
     assert id(SAM_MODEL.vision_encoder) == id(TRK_MODEL.vision_encoder), "vision_encoder not shared between SAM and TRK"
     print(f"[servers] vision_encoder backbone shared across detect/track/video (single VRAM copy)")
+
+    # 5) Build cached MODEL_META for /health and /v1/sam3/config. We hash the weights
+    #    once at startup; SHA-256 over a ~6 GB safetensors file takes ~10 s and is
+    #    skipped under SAM3_SKIP_WEIGHTS_HASH=1 for fast dev iteration.
+    global MODEL_META
+    weights_path = os.path.join(SAM_MODEL_NAME, "model.safetensors")
+    weights_sha256: Optional[str] = None
+    if os.environ.get("SAM3_SKIP_WEIGHTS_HASH", "0") != "1" and os.path.exists(weights_path):
+        h = hashlib.sha256()
+        with open(weights_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                h.update(chunk)
+        weights_sha256 = h.hexdigest()
+
+    cuda_cap = None
+    cuda_device_name = None
+    if torch.cuda.is_available():
+        try:
+            cuda_cap = list(torch.cuda.get_device_capability())
+            cuda_device_name = torch.cuda.get_device_name()
+        except Exception:
+            pass
+
+    MODEL_META = {
+        "model_path": SAM_MODEL_NAME,
+        "weights_file": weights_path,
+        "weights_sha256": weights_sha256,
+        "sam3_image_class": type(SAM_MODEL).__name__,
+        "sam3_tracker_class": type(TRK_MODEL).__name__,
+        "sam3_video_class": type(VID_MODEL).__name__,
+        "dtype": str(VID_DTYPE),
+        "transformers_version": transformers.__version__,
+        "torch_version": torch.__version__,
+        "cuda_capability": cuda_cap,
+        "cuda_device_name": cuda_device_name,
+        "vision_encoder_shared": True,  # asserted above; if assertion fails we never reach here
+    }
+    logger.info(
+        "models ready: class=%s, dtype=%s, weights_sha256=%s, transformers=%s",
+        MODEL_META["sam3_image_class"],
+        MODEL_META["dtype"],
+        (weights_sha256[:12] + "...") if weights_sha256 else "skipped",
+        transformers.__version__,
+    )
     print("[servers] all SAM3 models ready.")
 
 
@@ -376,6 +468,37 @@ def on_startup():
     _load_models()
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all so client gets a structured JSON body instead of opaque 500.
+    HTTPException is handled by FastAPI itself and never reaches here."""
+    tb = traceback.format_exc()
+    if _is_cuda_oom(exc):
+        # Try to free fragmentation so the next request has a chance.
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        logger.error("CUDA OOM on %s: %s\n%s", request.url.path, exc, tb)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": f"cuda_oom: {exc}",
+                "error_class": type(exc).__name__,
+                "retriable": True,
+            },
+        )
+    logger.error("unhandled exception on %s: %s\n%s", request.url.path, exc, tb)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": str(exc),
+            "error_class": type(exc).__name__,
+            "traceback_tail": "\n".join(tb.splitlines()[-8:]),
+        },
+    )
+
+
 @app.get("/health")
 def health():
     return {
@@ -386,6 +509,49 @@ def health():
             "sam3_tracker": TRK_MODEL is not None,
             "sam3_video": VID_MODEL is not None,
         },
+        "model": MODEL_META,
+    }
+
+
+@app.get("/v1/sam3/config")
+def sam3_config():
+    """Exposes processor + tokenizer constants and DetectRequest defaults so client
+    teams can confirm field names, image_size, tokenizer max_length, and the only
+    two thresholds the server honors. Pair with /openapi.json for the full schema."""
+    if SAM_PROCESSOR is None:
+        raise HTTPException(503, "SAM3 image processor not loaded")
+    image_proc = getattr(SAM_PROCESSOR, "image_processor", None)
+    image_size = getattr(image_proc, "size", None) if image_proc is not None else None
+    tokenizer = getattr(SAM_PROCESSOR, "tokenizer", None)
+    return {
+        "openapi_url": "/openapi.json",
+        "docs_url": "/docs",
+        "detect": {
+            "endpoint": "/v1/sam3/detect",
+            "method": "POST",
+            "field_names": ["image_b64", "prompt", "conf_threshold", "mask_threshold", "return_masks"],
+            "defaults": {
+                "conf_threshold": DetectRequest.model_fields["conf_threshold"].default,
+                "mask_threshold": DetectRequest.model_fields["mask_threshold"].default,
+                "return_masks": DetectRequest.model_fields["return_masks"].default,
+            },
+            "prompt_is_singular_string": True,
+            "thresholds_in_use": ["conf_threshold", "mask_threshold"],
+            "no_hardcoded_min_score": True,
+            "no_topk_filter": True,
+            "no_relevance_filter": True,
+        },
+        "processor": {
+            "image_processor_size": image_size,
+            "tokenizer_class": type(tokenizer).__name__ if tokenizer is not None else None,
+            "tokenizer_model_max_length": getattr(tokenizer, "model_max_length", None),
+            "tokenizer_truncates_silently": True,
+        },
+        "concurrency": {
+            "infer_lock": True,
+            "note": "All /detect, /track, /video inference is serialized behind a single lock.",
+        },
+        "model": MODEL_META,
     }
 
 
