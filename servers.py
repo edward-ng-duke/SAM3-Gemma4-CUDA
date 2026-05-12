@@ -179,7 +179,7 @@ def _extract_boxes_from_masks(mask_data, width, height):
     if mask_data is None:
         return boxes
     if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
+        mask_data = mask_data.detach().float().cpu().numpy()
     mask_data = np.array(mask_data)
     if mask_data.ndim == 4:
         mask_data = mask_data[0]
@@ -214,7 +214,7 @@ def _draw_video_masks_contours_and_boxes(frame_bgr, mask_data, prompt_text, scor
     if mask_data is None:
         return out
     if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
+        mask_data = mask_data.detach().float().cpu().numpy()
     mask_data = np.array(mask_data)
     if mask_data.ndim == 4:
         mask_data = mask_data.squeeze(1)
@@ -267,7 +267,7 @@ def _apply_mask_overlay(base_image: Image.Image, mask_data, opacity=0.5):
     if mask_data is None:
         return base_image.convert("RGB")
     if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
+        mask_data = mask_data.detach().float().cpu().numpy()
     mask_data = np.array(mask_data).astype(np.uint8)
     if mask_data.ndim == 4:
         mask_data = mask_data[0]
@@ -416,8 +416,11 @@ def detect(req: DetectRequest):
     if raw_masks is None or raw_scores is None or len(raw_scores) == 0:
         return DetectResponse(width=w, height=h, regions=[])
 
-    masks_np = raw_masks.detach().cpu().numpy()
-    scores_np = raw_scores.detach().cpu().numpy()
+    # .float() casts bfloat16 → float32; numpy has no bfloat16 dtype and would raise
+    # `TypeError: Got unsupported ScalarType BFloat16` on .numpy(). The model runs in
+    # VID_DTYPE=bfloat16, so any path where scores survive the threshold reaches here.
+    masks_np = raw_masks.detach().float().cpu().numpy()
+    scores_np = raw_scores.detach().float().cpu().numpy()
 
     regions: list[Region] = []
     for idx, mask in enumerate(masks_np):
@@ -463,7 +466,7 @@ def track(req: TrackRequest):
             outputs = TRK_MODEL(**inputs, multimask_output=False)
 
         masks = TRK_PROCESSOR.post_process_masks(
-            outputs.pred_masks.cpu(),
+            outputs.pred_masks.float().cpu(),
             inputs["original_sizes"],
             binarize=True,
         )[0]
