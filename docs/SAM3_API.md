@@ -12,7 +12,7 @@
 | 绑定 | `${SAM3_HOST:-0.0.0.0}:${SAM3_PORT:-5050}` |
 | 宿主端口（compose） | `${SAM3_HOST_PORT:-5050}` → 容器 5050 |
 | 客户端基础 URL | `${SAM3_SERVER_URL:-http://127.0.0.1:5050}` |
-| 模型 | `Sam3Model` + `Sam3TrackerModel` + `Sam3VideoModel` |
+| 模型 | `Sam3VideoModel`（顶层）+ `Sam3Model` 别名 + `Sam3TrackerModel`（共享 vision_encoder） |
 | 冷启动 | ~30–45s（首次 `/health` 三项全 true 即就绪） |
 | 显存 | 三个模型常驻 ~7-9 GB |
 | 离线 | `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`，权重从 `./models/facebook/sam3` 读 |
@@ -39,7 +39,7 @@
 
 ## 3. `GET /health`
 
-无请求体。响应（[servers.py:352-362](../servers.py#L352-L362)）：
+无请求体。响应（[servers.py:379-389](../servers.py#L379-L389)）：
 
 ```json
 {
@@ -59,7 +59,7 @@
 
 ## 4. `POST /v1/sam3/detect`
 
-**请求**（[servers.py:294-299](../servers.py#L294-L299) `DetectRequest`）：
+**请求**（[servers.py:321-326](../servers.py#L321-L326) `DetectRequest`）：
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
@@ -69,7 +69,7 @@
 | `mask_threshold` | float | `0.5` | mask 二值化阈值 |
 | `return_masks` | bool | `true` | 是否在响应里返回 `mask_b64` |
 
-**响应**（[servers.py:302-312](../servers.py#L302-L312) `DetectResponse` / `Region`）：
+**响应**（[servers.py:329-339](../servers.py#L329-L339) `DetectResponse` / `Region`）：
 
 ```json
 {
@@ -101,7 +101,7 @@
 
 ## 5. `POST /v1/sam3/track`
 
-**请求**（[servers.py:315-319](../servers.py#L315-L319) `TrackRequest`）：
+**请求**（[servers.py:342-344](../servers.py#L342-L344) `TrackRequest`）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -109,7 +109,7 @@
 | `points` | `int[][]` | `[[x,y], ...]` 累积点击坐标 |
 | `labels` | `int[]` | 每点的前/背景标签（1=foreground、0=background），长度需 = `points` |
 
-**响应**（[servers.py:321-323](../servers.py#L321-L323) `TrackResponse`）：
+**响应**（[servers.py:348-350](../servers.py#L348-L350) `TrackResponse`）：
 
 ```json
 {
@@ -126,7 +126,7 @@
 
 ## 6. `POST /v1/sam3/video`
 
-**请求**（[servers.py:326-331](../servers.py#L326-L331) `VideoRequest`）：
+**请求**（[servers.py:353-358](../servers.py#L353-L358) `VideoRequest`）：
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
@@ -138,7 +138,7 @@
 
 **视频路径要求**：当前单容器部署下，调用方与服务在同一进程空间，路径可以是临时文件。若以后拆成"两容器"，需把 `SAM3_VIDEO_OUT_DIR` 挂为共享 volume，让两端都能 read/write（详见 [servers.py:58-63 注释](../servers.py#L58-L63)）。`servers_client.sam3_video` 已经做了"按需 stage 到 `SAM3_VIDEO_OUT_DIR/inputs/`" 的兜底。
 
-**响应**（[servers.py:334-338](../servers.py#L334-L338) `VideoResponse`）：
+**响应**（[servers.py:361-365](../servers.py#L361-L365) `VideoResponse`）：
 
 ```json
 {
@@ -219,7 +219,7 @@ curl -s -X POST http://localhost:5050/v1/sam3/video \
 服务进程持有一把全局推理锁（`threading.Lock`）。三个 endpoint 的 model forward
 阶段是**串行**的——并发请求会在锁上 FIFO 排队，**任一时刻最多一个推理在跑**。
 
-- 视频 endpoint 锁住整个帧 propagate 循环（视频 session 跨帧有状态）。
+- 视频 endpoint 锁住 session 初始化 + 整个帧 propagate 循环（视频 session 跨帧有状态）。
 - 视频解码/编码 I/O 在锁外，多请求的 I/O 可并行。
 - detect/track 单次推理通常几百毫秒，排队对前端影响小。
 - 这是为了配合"vision_encoder 单份显存"的策略，避免并发推理把 backbone activations 撑爆 VRAM。
