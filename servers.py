@@ -24,6 +24,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import base64
 import io
 import tempfile
+import threading
 from typing import Optional
 
 import cv2
@@ -71,6 +72,8 @@ VIDEO_COLORS_BGR = [
     (74, 87, 140),
 ]
 
+
+_INFER_LOCK = threading.Lock()
 
 SAM_MODEL: Optional[Sam3Model] = None
 SAM_PROCESSOR: Optional[Sam3Processor] = None
@@ -372,16 +375,17 @@ def detect(req: DetectRequest):
     image = _decode_b64_image(req.image_b64)
     w, h = image.size
 
-    inputs = SAM_PROCESSOR(images=image, text=req.prompt, return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        outputs = SAM_MODEL(**inputs)
+    with _INFER_LOCK:
+        inputs = SAM_PROCESSOR(images=image, text=req.prompt, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            outputs = SAM_MODEL(**inputs)
 
-    processed = SAM_PROCESSOR.post_process_instance_segmentation(
-        outputs,
-        threshold=float(req.conf_threshold),
-        mask_threshold=float(req.mask_threshold),
-        target_sizes=inputs.get("original_sizes").tolist(),
-    )[0]
+        processed = SAM_PROCESSOR.post_process_instance_segmentation(
+            outputs,
+            threshold=float(req.conf_threshold),
+            mask_threshold=float(req.mask_threshold),
+            target_sizes=inputs.get("original_sizes").tolist(),
+        )[0]
 
     raw_masks = processed.get("masks")
     raw_scores = processed.get("scores")
@@ -423,21 +427,22 @@ def track(req: TrackRequest):
     input_points = [[req.points]]
     input_labels = [[req.labels]]
 
-    inputs = TRK_PROCESSOR(
-        images=image,
-        input_points=input_points,
-        input_labels=input_labels,
-        return_tensors="pt",
-    ).to(DEVICE)
+    with _INFER_LOCK:
+        inputs = TRK_PROCESSOR(
+            images=image,
+            input_points=input_points,
+            input_labels=input_labels,
+            return_tensors="pt",
+        ).to(DEVICE)
 
-    with torch.no_grad():
-        outputs = TRK_MODEL(**inputs, multimask_output=False)
+        with torch.no_grad():
+            outputs = TRK_MODEL(**inputs, multimask_output=False)
 
-    masks = TRK_PROCESSOR.post_process_masks(
-        outputs.pred_masks.cpu(),
-        inputs["original_sizes"],
-        binarize=True,
-    )[0]
+        masks = TRK_PROCESSOR.post_process_masks(
+            outputs.pred_masks.cpu(),
+            inputs["original_sizes"],
+            binarize=True,
+        )[0]
 
     if masks is None or len(masks) == 0:
         overlay = _draw_points_on_image(image, req.points)
@@ -479,13 +484,6 @@ def video(req: VideoRequest):
     if len(frames_rgb) == 0:
         raise HTTPException(400, "no readable frames in video")
 
-    session = VID_PROCESSOR.init_video_session(
-        video=frames_rgb,
-        inference_device=DEVICE,
-        dtype=VID_DTYPE,
-    )
-    session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=req.prompt)
-
     out_path = tempfile.mktemp(suffix=".mp4", prefix="sam3_video_", dir=VIDEO_OUT_DIR)
     writer = cv2.VideoWriter(
         out_path,
@@ -497,40 +495,48 @@ def video(req: VideoRequest):
     processed = 0
     masked = 0
 
-    for model_out in VID_MODEL.propagate_in_video_iterator(
-        inference_session=session,
-        max_frame_num_to_track=len(frames_rgb),
-    ):
-        post = VID_PROCESSOR.postprocess_outputs(session, model_out)
-        f_idx = model_out.frame_idx
-        frame_rgb = frames_rgb[f_idx]
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    with _INFER_LOCK:
+        session = VID_PROCESSOR.init_video_session(
+            video=frames_rgb,
+            inference_device=DEVICE,
+            dtype=VID_DTYPE,
+        )
+        session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=req.prompt)
 
-        masks = post.get("masks") if "masks" in post else None
-        if masks is not None and hasattr(masks, "ndim") and masks.ndim == 4:
-            masks = masks.squeeze(1)
+        for model_out in VID_MODEL.propagate_in_video_iterator(
+            inference_session=session,
+            max_frame_num_to_track=len(frames_rgb),
+        ):
+            post = VID_PROCESSOR.postprocess_outputs(session, model_out)
+            f_idx = model_out.frame_idx
+            frame_rgb = frames_rgb[f_idx]
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-        # Truthy check: tracker may return an empty (0, H, W) tensor for frames where
-        # no instance has been propagated yet — those should NOT count as "masked".
-        has_masks = masks is not None and getattr(masks, "shape", (0,))[0] > 0
+            masks = post.get("masks") if "masks" in post else None
+            if masks is not None and hasattr(masks, "ndim") and masks.ndim == 4:
+                masks = masks.squeeze(1)
 
-        if req.render_mode == "annotated":
-            if has_masks:
-                scores = post.get("scores", None)
-                out_bgr = _draw_video_masks_contours_and_boxes(frame_bgr, masks, req.prompt, scores=scores)
-                masked += 1
-            else:
-                out_bgr = frame_bgr
-        else:  # "mask"
-            if has_masks:
-                pil = _apply_mask_overlay(Image.fromarray(frame_rgb), masks)
-                out_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-                masked += 1
-            else:
-                out_bgr = frame_bgr
+            # Truthy check: tracker may return an empty (0, H, W) tensor for frames where
+            # no instance has been propagated yet — those should NOT count as "masked".
+            has_masks = masks is not None and getattr(masks, "shape", (0,))[0] > 0
 
-        writer.write(out_bgr)
-        processed += 1
+            if req.render_mode == "annotated":
+                if has_masks:
+                    scores = post.get("scores", None)
+                    out_bgr = _draw_video_masks_contours_and_boxes(frame_bgr, masks, req.prompt, scores=scores)
+                    masked += 1
+                else:
+                    out_bgr = frame_bgr
+            else:  # "mask"
+                if has_masks:
+                    pil = _apply_mask_overlay(Image.fromarray(frame_rgb), masks)
+                    out_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+                    masked += 1
+                else:
+                    out_bgr = frame_bgr
+
+            writer.write(out_bgr)
+            processed += 1
 
     writer.release()
 
