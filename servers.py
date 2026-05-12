@@ -87,30 +87,54 @@ def _load_models():
     global SAM_MODEL, SAM_PROCESSOR, TRK_MODEL, TRK_PROCESSOR, VID_MODEL, VID_PROCESSOR
 
     print(f"[servers] device={DEVICE}, vid_dtype={VID_DTYPE}")
-    print(f"[servers] loading SAM3 image model from {SAM_MODEL_NAME} ...")
-    SAM_MODEL = Sam3Model.from_pretrained(SAM_MODEL_NAME).to(DEVICE).eval()
-    SAM_PROCESSOR = Sam3Processor.from_pretrained(SAM_MODEL_NAME)
 
-    print("[servers] loading SAM3 tracker model (remap from sam3 video checkpoint) ...")
-    sam_cfg = AutoConfig.from_pretrained(SAM_MODEL_NAME)
-    TRK_MODEL = Sam3TrackerModel(sam_cfg)
-    raw_sd = load_safetensors(os.path.join(SAM_MODEL_NAME, "model.safetensors"))
-    remapped = {}
-    for k, v in raw_sd.items():
-        if k.startswith("tracker_model."):
-            remapped[k[len("tracker_model."):]] = v
-        elif k.startswith("detector_model.vision_encoder."):
-            remapped["vision_encoder." + k[len("detector_model.vision_encoder."):]] = v
-    missing, unexpected = TRK_MODEL.load_state_dict(remapped, strict=False)
-    print(f"[servers] tracker remap: {len(remapped)} loaded, {len(missing)} missing, {len(unexpected)} unexpected")
-    TRK_MODEL = TRK_MODEL.to(DEVICE).eval()
-    TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(SAM_MODEL_NAME)
-
-    print("[servers] loading SAM3 video model ...")
+    # 1) 一次性加载完整 Sam3VideoModel，覆盖 detector + tracker_video + tracker_neck
+    #    所有 namespace（detector_model.*, tracker_model.*, tracker_neck.*）都被 load。
+    print(f"[servers] loading Sam3VideoModel from {SAM_MODEL_NAME} (single source for all three endpoints) ...")
     VID_MODEL = Sam3VideoModel.from_pretrained(SAM_MODEL_NAME, dtype=VID_DTYPE).to(DEVICE).eval()
     VID_PROCESSOR = Sam3VideoProcessor.from_pretrained(SAM_MODEL_NAME)
 
-    print("[servers] all SAM3 models loaded. (VLM uses external Qwen, not in this process.)")
+    # 2) /v1/sam3/detect 用的 Sam3Model = VID_MODEL.detector_model（共享，不复制）
+    SAM_MODEL = VID_MODEL.detector_model
+    SAM_PROCESSOR = Sam3Processor.from_pretrained(SAM_MODEL_NAME)
+
+    # 3) /v1/sam3/track 用的 Sam3TrackerModel：单独实例化（不同 forward 签名），
+    #    但把它的 vision_encoder 替换成 VID_MODEL.detector_model.vision_encoder 的同一引用。
+    print("[servers] building Sam3TrackerModel with SHARED vision_encoder (no extra backbone in VRAM) ...")
+    sam_cfg = AutoConfig.from_pretrained(SAM_MODEL_NAME)
+    trk_cfg = sam_cfg.tracker_config if hasattr(sam_cfg, "tracker_config") else sam_cfg
+    TRK_MODEL = Sam3TrackerModel(trk_cfg)
+    # 替换 vision_encoder 引用 —— 自动接入 nn.Module tree（PyTorch 标准行为）
+    del TRK_MODEL.vision_encoder
+    TRK_MODEL.vision_encoder = VID_MODEL.detector_model.vision_encoder
+
+    # 只 load tracker_model.* 部分权重（不含 vision_encoder，因为它已经共享自 detector）
+    raw_sd = load_safetensors(os.path.join(SAM_MODEL_NAME, "model.safetensors"))
+    tracker_sd = {
+        k[len("tracker_model."):]: v
+        for k, v in raw_sd.items()
+        if k.startswith("tracker_model.")
+    }
+    missing, unexpected = TRK_MODEL.load_state_dict(tracker_sd, strict=False)
+    # missing 必含所有 vision_encoder.* 键（这是预期的，它们走共享引用了）
+    vision_missing = [m for m in missing if m.startswith("vision_encoder.")]
+    other_missing = [m for m in missing if not m.startswith("vision_encoder.")]
+    print(
+        f"[servers] tracker: loaded {len(tracker_sd)} weights, "
+        f"{len(vision_missing)} vision_encoder.* missing (expected, shared), "
+        f"{len(other_missing)} other missing, {len(unexpected)} unexpected"
+    )
+    assert not other_missing, f"unexpected missing keys: {other_missing[:5]}"
+
+    # tracker 的非 vision_encoder 子模块需要搬上 device。.to(DEVICE) 会递归，
+    # 但共享的 vision_encoder 已经在 DEVICE 上，.to() 对它是 no-op（不会重复分配）。
+    TRK_MODEL = TRK_MODEL.to(DEVICE).eval()
+    TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(SAM_MODEL_NAME)
+
+    # 4) 健全性自检：vision_encoder 内存里只有 1 份（id 相同）
+    assert id(SAM_MODEL.vision_encoder) == id(TRK_MODEL.vision_encoder), "vision_encoder not shared between SAM and TRK"
+    print(f"[servers] vision_encoder backbone shared across detect/track/video (single VRAM copy)")
+    print("[servers] all SAM3 models ready.")
 
 
 # ---------- helpers ----------
