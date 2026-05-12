@@ -16,6 +16,7 @@ OUT_DIR  ?= /home/edward/research/lianzhong-project/data/outputs/反向教学教
 
 .PHONY: help dev dev-orchestrate run serve venv install models gemma-model download clean-venv clean-models status stop detect report \
         docker-build docker-up docker-down docker-logs docker-restart docker-clean docker-shell \
+        deploy deploy-rebuild deploy-verify \
         eval-blade
 
 help:
@@ -35,6 +36,8 @@ help:
 	@echo "  make report       — generate HTML report from OUT_DIR/json/"
 	@echo ""
 	@echo "Docker (fully offline) targets:"
+	@echo "  make deploy       — up + verify using existing sam3-cuda:latest image (no rebuild)"
+	@echo "  make deploy-rebuild — force docker-build first, then up + verify (use after Dockerfile/requirements changes)"
 	@echo "  make docker-build — build sam3-cuda:latest with SAM3 weights baked in (slow, ~15min)"
 	@echo "  make docker-up    — docker compose up -d  (single 'sam3' container, two processes)"
 	@echo "  make docker-down  — docker compose down"
@@ -143,6 +146,38 @@ docker-shell:
 
 docker-clean:
 	$(DC) down -v --rmi local
+
+# Default deploy: assume sam3-cuda:latest is already built (it bakes ~6.5GB SAM3
+# weights + CUDA base, so rebuilding is expensive). If the image is missing we
+# fail loudly and tell the user to run `make deploy-rebuild` (or `make docker-build`).
+# If you changed Dockerfile/requirements.txt, use `make deploy-rebuild`.
+deploy:
+	@if ! docker image inspect sam3-cuda:latest >/dev/null 2>&1; then \
+	  echo "[deploy] sam3-cuda:latest not found locally."; \
+	  echo "[deploy] Run 'make deploy-rebuild' to build it (slow, ~15min, pulls CUDA base)."; \
+	  exit 1; \
+	fi
+	@echo "[deploy] using existing sam3-cuda:latest (no rebuild)"
+	@$(MAKE) --no-print-directory docker-up
+	@$(MAKE) --no-print-directory deploy-verify
+
+deploy-rebuild: docker-build docker-up deploy-verify
+
+deploy-verify:
+	@echo "[deploy] waiting for SAM3 API on host (up to 120s) ..."
+	@set -a; [ -f .env.docker ] && . ./.env.docker; set +a; \
+	SAM3=$${SAM3_HOST_PORT:-5050}; UI=$${GRADIO_HOST_PORT:-17860}; \
+	for i in $$(seq 1 60); do \
+	  if curl -sf "http://127.0.0.1:$$SAM3/health" 2>/dev/null | grep -q '"sam3_video":true'; then \
+	    echo "[deploy] SAM3 API ready at http://localhost:$$SAM3"; \
+	    echo "[deploy] Gradio UI: http://localhost:$$UI"; \
+	    echo "[deploy] SAM3 API: http://localhost:$$SAM3  (docs: docs/SAM3_API.md)"; \
+	    exit 0; \
+	  fi; \
+	  sleep 2; \
+	done; \
+	echo "[deploy] SAM3 API NOT ready within 120s — run 'make docker-logs' to inspect"; \
+	exit 1
 
 stop:
 	@echo "[stop] killing app.py / servers.py processes..."
