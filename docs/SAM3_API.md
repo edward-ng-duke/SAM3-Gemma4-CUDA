@@ -14,8 +14,10 @@
 | 客户端基础 URL | `${SAM3_SERVER_URL:-http://127.0.0.1:5050}` |
 | 模型 | `Sam3Model` + `Sam3TrackerModel` + `Sam3VideoModel` |
 | 冷启动 | ~30–45s（首次 `/health` 三项全 true 即就绪） |
-| 显存 | 三个模型常驻 ~12 GB |
+| 显存 | 三个模型常驻 ~7-9 GB |
 | 离线 | `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`，权重从 `./models/facebook/sam3` 读 |
+
+启动时通过 `Sam3VideoModel.from_pretrained` 一次性加载权重，`Sam3Model` / `Sam3TrackerModel` / `Sam3VideoModel` 三个对象**共享同一份 vision_encoder backbone**（GPU 内存里只有 1 份骨干副本）。冷启动 ≈ 30-45s，显存常驻 ~7-9GB。
 
 启动方式：
 
@@ -29,8 +31,8 @@
 | Method | Path | 用途 | 后端模型 |
 |---|---|---|---|
 | GET | `/health` | 健康检查 / 模型加载状态 | — |
-| POST | `/v1/sam3/detect` | 图像 + 文本 prompt → bbox + mask | `Sam3Model` |
-| POST | `/v1/sam3/track` | 图像 + 点击点 → 渲染好的 overlay 图像 | `Sam3TrackerModel` |
+| POST | `/v1/sam3/detect` | 图像 + 文本 prompt → bbox + mask | `Sam3Model`（实例 = `VID_MODEL.detector_model`） |
+| POST | `/v1/sam3/track` | 图像 + 点击点 → 渲染好的 overlay 图像 | `Sam3TrackerModel`（vision_encoder 共享 detector backbone） |
 | POST | `/v1/sam3/video` | 视频路径 + 文本 prompt → 渲染好的 mp4 | `Sam3VideoModel` |
 
 ---
@@ -209,3 +211,17 @@ curl -s -X POST http://localhost:5050/v1/sam3/video \
 | 容器（多实例） | `http://localhost:${SAM3_HOST_PORT}` | `http://localhost:${GRADIO_HOST_PORT}` |
 
 容器内部 entrypoint 始终先起 server（5050），健康检查通过后再 exec UI（7860）—— Gradio UI 进程会通过 `127.0.0.1:5050` 调用 server，**和外部调用方走同一份 API**。
+
+---
+
+## 10. 并发模型
+
+服务进程持有一把全局推理锁（`threading.Lock`）。三个 endpoint 的 model forward
+阶段是**串行**的——并发请求会在锁上 FIFO 排队，**任一时刻最多一个推理在跑**。
+
+- 视频 endpoint 锁住整个帧 propagate 循环（视频 session 跨帧有状态）。
+- 视频解码/编码 I/O 在锁外，多请求的 I/O 可并行。
+- detect/track 单次推理通常几百毫秒，排队对前端影响小。
+- 这是为了配合"vision_encoder 单份显存"的策略，避免并发推理把 backbone activations 撑爆 VRAM。
+
+如果要提高并发，唯一安全的方式是再起一个容器实例（用 `GRADIO_HOST_PORT` / `SAM3_HOST_PORT` 多实例部署，见 docker-compose.yml 顶部注释）。
