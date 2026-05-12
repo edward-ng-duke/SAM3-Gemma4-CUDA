@@ -41,9 +41,14 @@ services:
     ports:
       - "${GRADIO_HOST_PORT:-17860}:7860"
       - "${SAM3_HOST_PORT:-5050}:5050"
-    # volumes:
-    #   # Uncomment to persist generated videos on the host:
-    #   - ./sam3_out:/var/sam3_data
+    volumes:
+      # Host-side servers.py overlay so we can ship code changes (e.g. the bfloat16
+      # → numpy fix in detect()) without a 15-min image rebuild. Remove this line
+      # after the next `make deploy-rebuild` bakes the fix in. See plan
+      # /home/edward/.claude/plans/sam-api-sam3-radiant-stallman.md.
+      - ./servers.py:/app/servers.py:ro
+      # # Uncomment to persist generated videos on the host:
+      # - ./sam3_out:/var/sam3_data
     deploy:
       resources:
         reservations:
