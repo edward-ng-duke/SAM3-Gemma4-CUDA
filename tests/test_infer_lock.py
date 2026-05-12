@@ -15,7 +15,12 @@ def test_endpoints_acquire_lock(monkeypatch):
             return [{"masks": None, "scores": None}]
     class _FakeBatched(dict):
         def to(self, *_): return self
-        def get(self, k, d=None): return d
+        def get(self, k, d=None):
+            if k == "original_sizes":
+                class _T:
+                    def tolist(self): return [[8, 8]]
+                return _T()
+            return d
     class _FakeModel:
         def __call__(self, **kw):
             time.sleep(0.2)
