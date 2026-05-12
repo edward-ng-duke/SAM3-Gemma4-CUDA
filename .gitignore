@@ -12,3 +12,4 @@ __pycache__/
 .coverage
 data/blade_eval/
 reports/blade/
+logs/
