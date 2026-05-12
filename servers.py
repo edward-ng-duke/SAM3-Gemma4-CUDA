@@ -22,15 +22,22 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import base64
+import hashlib
 import io
+import logging
+import logging.handlers
 import tempfile
-from typing import Optional
+import threading
+import traceback
+from typing import Any, Optional
 
 import cv2
 import numpy as np
 import torch
+import transformers
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw
 from pydantic import BaseModel
 from safetensors.torch import load_file as load_safetensors
@@ -72,6 +79,8 @@ VIDEO_COLORS_BGR = [
 ]
 
 
+_INFER_LOCK = threading.Lock()
+
 SAM_MODEL: Optional[Sam3Model] = None
 SAM_PROCESSOR: Optional[Sam3Processor] = None
 TRK_MODEL: Optional[Sam3TrackerModel] = None
@@ -79,35 +88,145 @@ TRK_PROCESSOR: Optional[Sam3TrackerProcessor] = None
 VID_MODEL: Optional[Sam3VideoModel] = None
 VID_PROCESSOR: Optional[Sam3VideoProcessor] = None
 
+# Populated at startup by _load_models(); cached so /health and /v1/sam3/config stay O(1).
+MODEL_META: dict[str, Any] = {}
+
+LOG_DIR = os.environ.get("SAM3_LOG_DIR", os.path.join(_HERE, "logs"))
+LOG_PATH = os.path.join(LOG_DIR, "sam3_server.log")
+
+logger = logging.getLogger("sam3.server")
+
+
+def _setup_logging() -> None:
+    if logger.handlers:
+        return
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_PATH, maxBytes=50 * 1024 * 1024, backupCount=5
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except OSError as e:
+        # Log dir not writable (rare; e.g., read-only container fs). Stream-only logging
+        # still works for journalctl / docker logs, so don't crash startup.
+        print(f"[servers] WARN: rotating file log disabled ({e}); using stderr only")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    logger.propagate = False
+
+
+_setup_logging()
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """torch raises OutOfMemoryError on newer versions; older versions raise RuntimeError
+    whose message contains 'out of memory'."""
+    oom_cls = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(exc, oom_cls):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
 
 def _load_models():
     global SAM_MODEL, SAM_PROCESSOR, TRK_MODEL, TRK_PROCESSOR, VID_MODEL, VID_PROCESSOR
 
     print(f"[servers] device={DEVICE}, vid_dtype={VID_DTYPE}")
-    print(f"[servers] loading SAM3 image model from {SAM_MODEL_NAME} ...")
-    SAM_MODEL = Sam3Model.from_pretrained(SAM_MODEL_NAME).to(DEVICE).eval()
-    SAM_PROCESSOR = Sam3Processor.from_pretrained(SAM_MODEL_NAME)
 
-    print("[servers] loading SAM3 tracker model (remap from sam3 video checkpoint) ...")
-    sam_cfg = AutoConfig.from_pretrained(SAM_MODEL_NAME)
-    TRK_MODEL = Sam3TrackerModel(sam_cfg)
-    raw_sd = load_safetensors(os.path.join(SAM_MODEL_NAME, "model.safetensors"))
-    remapped = {}
-    for k, v in raw_sd.items():
-        if k.startswith("tracker_model."):
-            remapped[k[len("tracker_model."):]] = v
-        elif k.startswith("detector_model.vision_encoder."):
-            remapped["vision_encoder." + k[len("detector_model.vision_encoder."):]] = v
-    missing, unexpected = TRK_MODEL.load_state_dict(remapped, strict=False)
-    print(f"[servers] tracker remap: {len(remapped)} loaded, {len(missing)} missing, {len(unexpected)} unexpected")
-    TRK_MODEL = TRK_MODEL.to(DEVICE).eval()
-    TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(SAM_MODEL_NAME)
-
-    print("[servers] loading SAM3 video model ...")
+    # 1) 一次性加载完整 Sam3VideoModel，覆盖 detector + tracker_video + tracker_neck
+    #    所有 namespace（detector_model.*, tracker_model.*, tracker_neck.*）都被 load。
+    print(f"[servers] loading Sam3VideoModel from {SAM_MODEL_NAME} (single source for all three endpoints) ...")
     VID_MODEL = Sam3VideoModel.from_pretrained(SAM_MODEL_NAME, dtype=VID_DTYPE).to(DEVICE).eval()
     VID_PROCESSOR = Sam3VideoProcessor.from_pretrained(SAM_MODEL_NAME)
 
-    print("[servers] all SAM3 models loaded. (VLM uses external Qwen, not in this process.)")
+    # 2) /v1/sam3/detect 用的 Sam3Model = VID_MODEL.detector_model（共享，不复制）
+    SAM_MODEL = VID_MODEL.detector_model
+    SAM_PROCESSOR = Sam3Processor.from_pretrained(SAM_MODEL_NAME)
+
+    # 3) /v1/sam3/track 用的 Sam3TrackerModel：单独实例化（不同 forward 签名），
+    #    但把它的 vision_encoder 替换成 VID_MODEL.detector_model.vision_encoder 的同一引用。
+    print("[servers] building Sam3TrackerModel with SHARED vision_encoder (no extra backbone in VRAM) ...")
+    sam_cfg = AutoConfig.from_pretrained(SAM_MODEL_NAME)
+    trk_cfg = sam_cfg.tracker_config if hasattr(sam_cfg, "tracker_config") else sam_cfg
+    TRK_MODEL = Sam3TrackerModel(trk_cfg)
+    # 替换 vision_encoder 引用 —— 自动接入 nn.Module tree（PyTorch 标准行为）
+    del TRK_MODEL.vision_encoder
+    TRK_MODEL.vision_encoder = VID_MODEL.detector_model.vision_encoder
+
+    # 只 load tracker_model.* 部分权重（不含 vision_encoder，因为它已经共享自 detector）
+    raw_sd = load_safetensors(os.path.join(SAM_MODEL_NAME, "model.safetensors"))
+    tracker_sd = {
+        k[len("tracker_model."):]: v
+        for k, v in raw_sd.items()
+        if k.startswith("tracker_model.")
+    }
+    missing, unexpected = TRK_MODEL.load_state_dict(tracker_sd, strict=False)
+    # missing 必含所有 vision_encoder.* 键（这是预期的，它们走共享引用了）
+    vision_missing = [m for m in missing if m.startswith("vision_encoder.")]
+    other_missing = [m for m in missing if not m.startswith("vision_encoder.")]
+    print(
+        f"[servers] tracker: loaded {len(tracker_sd)} weights, "
+        f"{len(vision_missing)} vision_encoder.* missing (expected, shared), "
+        f"{len(other_missing)} other missing, {len(unexpected)} unexpected"
+    )
+    assert not other_missing, f"unexpected missing keys: {other_missing[:5]}"
+
+    # tracker 的非 vision_encoder 子模块需要搬上 device。.to(DEVICE) 会递归，
+    # 但共享的 vision_encoder 已经在 DEVICE 上，.to() 对它是 no-op（不会重复分配）。
+    TRK_MODEL = TRK_MODEL.to(DEVICE).eval()
+    TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(SAM_MODEL_NAME)
+
+    # 4) 健全性自检：vision_encoder 内存里只有 1 份（id 相同）
+    assert id(SAM_MODEL.vision_encoder) == id(TRK_MODEL.vision_encoder), "vision_encoder not shared between SAM and TRK"
+    print(f"[servers] vision_encoder backbone shared across detect/track/video (single VRAM copy)")
+
+    # 5) Build cached MODEL_META for /health and /v1/sam3/config. We hash the weights
+    #    once at startup; SHA-256 over a ~6 GB safetensors file takes ~10 s and is
+    #    skipped under SAM3_SKIP_WEIGHTS_HASH=1 for fast dev iteration.
+    global MODEL_META
+    weights_path = os.path.join(SAM_MODEL_NAME, "model.safetensors")
+    weights_sha256: Optional[str] = None
+    if os.environ.get("SAM3_SKIP_WEIGHTS_HASH", "0") != "1" and os.path.exists(weights_path):
+        h = hashlib.sha256()
+        with open(weights_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                h.update(chunk)
+        weights_sha256 = h.hexdigest()
+
+    cuda_cap = None
+    cuda_device_name = None
+    if torch.cuda.is_available():
+        try:
+            cuda_cap = list(torch.cuda.get_device_capability())
+            cuda_device_name = torch.cuda.get_device_name()
+        except Exception:
+            pass
+
+    MODEL_META = {
+        "model_path": SAM_MODEL_NAME,
+        "weights_file": weights_path,
+        "weights_sha256": weights_sha256,
+        "sam3_image_class": type(SAM_MODEL).__name__,
+        "sam3_tracker_class": type(TRK_MODEL).__name__,
+        "sam3_video_class": type(VID_MODEL).__name__,
+        "dtype": str(VID_DTYPE),
+        "transformers_version": transformers.__version__,
+        "torch_version": torch.__version__,
+        "cuda_capability": cuda_cap,
+        "cuda_device_name": cuda_device_name,
+        "vision_encoder_shared": True,  # asserted above; if assertion fails we never reach here
+    }
+    logger.info(
+        "models ready: class=%s, dtype=%s, weights_sha256=%s, transformers=%s",
+        MODEL_META["sam3_image_class"],
+        MODEL_META["dtype"],
+        (weights_sha256[:12] + "...") if weights_sha256 else "skipped",
+        transformers.__version__,
+    )
+    print("[servers] all SAM3 models ready.")
 
 
 # ---------- helpers ----------
@@ -152,7 +271,7 @@ def _extract_boxes_from_masks(mask_data, width, height):
     if mask_data is None:
         return boxes
     if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
+        mask_data = mask_data.detach().float().cpu().numpy()
     mask_data = np.array(mask_data)
     if mask_data.ndim == 4:
         mask_data = mask_data[0]
@@ -187,7 +306,7 @@ def _draw_video_masks_contours_and_boxes(frame_bgr, mask_data, prompt_text, scor
     if mask_data is None:
         return out
     if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
+        mask_data = mask_data.detach().float().cpu().numpy()
     mask_data = np.array(mask_data)
     if mask_data.ndim == 4:
         mask_data = mask_data.squeeze(1)
@@ -240,7 +359,7 @@ def _apply_mask_overlay(base_image: Image.Image, mask_data, opacity=0.5):
     if mask_data is None:
         return base_image.convert("RGB")
     if isinstance(mask_data, torch.Tensor):
-        mask_data = mask_data.detach().cpu().numpy()
+        mask_data = mask_data.detach().float().cpu().numpy()
     mask_data = np.array(mask_data).astype(np.uint8)
     if mask_data.ndim == 4:
         mask_data = mask_data[0]
@@ -349,6 +468,37 @@ def on_startup():
     _load_models()
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all so client gets a structured JSON body instead of opaque 500.
+    HTTPException is handled by FastAPI itself and never reaches here."""
+    tb = traceback.format_exc()
+    if _is_cuda_oom(exc):
+        # Try to free fragmentation so the next request has a chance.
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        logger.error("CUDA OOM on %s: %s\n%s", request.url.path, exc, tb)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": f"cuda_oom: {exc}",
+                "error_class": type(exc).__name__,
+                "retriable": True,
+            },
+        )
+    logger.error("unhandled exception on %s: %s\n%s", request.url.path, exc, tb)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": str(exc),
+            "error_class": type(exc).__name__,
+            "traceback_tail": "\n".join(tb.splitlines()[-8:]),
+        },
+    )
+
+
 @app.get("/health")
 def health():
     return {
@@ -359,6 +509,49 @@ def health():
             "sam3_tracker": TRK_MODEL is not None,
             "sam3_video": VID_MODEL is not None,
         },
+        "model": MODEL_META,
+    }
+
+
+@app.get("/v1/sam3/config")
+def sam3_config():
+    """Exposes processor + tokenizer constants and DetectRequest defaults so client
+    teams can confirm field names, image_size, tokenizer max_length, and the only
+    two thresholds the server honors. Pair with /openapi.json for the full schema."""
+    if SAM_PROCESSOR is None:
+        raise HTTPException(503, "SAM3 image processor not loaded")
+    image_proc = getattr(SAM_PROCESSOR, "image_processor", None)
+    image_size = getattr(image_proc, "size", None) if image_proc is not None else None
+    tokenizer = getattr(SAM_PROCESSOR, "tokenizer", None)
+    return {
+        "openapi_url": "/openapi.json",
+        "docs_url": "/docs",
+        "detect": {
+            "endpoint": "/v1/sam3/detect",
+            "method": "POST",
+            "field_names": ["image_b64", "prompt", "conf_threshold", "mask_threshold", "return_masks"],
+            "defaults": {
+                "conf_threshold": DetectRequest.model_fields["conf_threshold"].default,
+                "mask_threshold": DetectRequest.model_fields["mask_threshold"].default,
+                "return_masks": DetectRequest.model_fields["return_masks"].default,
+            },
+            "prompt_is_singular_string": True,
+            "thresholds_in_use": ["conf_threshold", "mask_threshold"],
+            "no_hardcoded_min_score": True,
+            "no_topk_filter": True,
+            "no_relevance_filter": True,
+        },
+        "processor": {
+            "image_processor_size": image_size,
+            "tokenizer_class": type(tokenizer).__name__ if tokenizer is not None else None,
+            "tokenizer_model_max_length": getattr(tokenizer, "model_max_length", None),
+            "tokenizer_truncates_silently": True,
+        },
+        "concurrency": {
+            "infer_lock": True,
+            "note": "All /detect, /track, /video inference is serialized behind a single lock.",
+        },
+        "model": MODEL_META,
     }
 
 
@@ -372,24 +565,28 @@ def detect(req: DetectRequest):
     image = _decode_b64_image(req.image_b64)
     w, h = image.size
 
-    inputs = SAM_PROCESSOR(images=image, text=req.prompt, return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        outputs = SAM_MODEL(**inputs)
+    with _INFER_LOCK:
+        inputs = SAM_PROCESSOR(images=image, text=req.prompt, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            outputs = SAM_MODEL(**inputs)
 
-    processed = SAM_PROCESSOR.post_process_instance_segmentation(
-        outputs,
-        threshold=float(req.conf_threshold),
-        mask_threshold=float(req.mask_threshold),
-        target_sizes=inputs.get("original_sizes").tolist(),
-    )[0]
+        processed = SAM_PROCESSOR.post_process_instance_segmentation(
+            outputs,
+            threshold=float(req.conf_threshold),
+            mask_threshold=float(req.mask_threshold),
+            target_sizes=inputs.get("original_sizes").tolist(),
+        )[0]
 
     raw_masks = processed.get("masks")
     raw_scores = processed.get("scores")
     if raw_masks is None or raw_scores is None or len(raw_scores) == 0:
         return DetectResponse(width=w, height=h, regions=[])
 
-    masks_np = raw_masks.detach().cpu().numpy()
-    scores_np = raw_scores.detach().cpu().numpy()
+    # .float() casts bfloat16 → float32; numpy has no bfloat16 dtype and would raise
+    # `TypeError: Got unsupported ScalarType BFloat16` on .numpy(). The model runs in
+    # VID_DTYPE=bfloat16, so any path where scores survive the threshold reaches here.
+    masks_np = raw_masks.detach().float().cpu().numpy()
+    scores_np = raw_scores.detach().float().cpu().numpy()
 
     regions: list[Region] = []
     for idx, mask in enumerate(masks_np):
@@ -423,21 +620,22 @@ def track(req: TrackRequest):
     input_points = [[req.points]]
     input_labels = [[req.labels]]
 
-    inputs = TRK_PROCESSOR(
-        images=image,
-        input_points=input_points,
-        input_labels=input_labels,
-        return_tensors="pt",
-    ).to(DEVICE)
+    with _INFER_LOCK:
+        inputs = TRK_PROCESSOR(
+            images=image,
+            input_points=input_points,
+            input_labels=input_labels,
+            return_tensors="pt",
+        ).to(DEVICE)
 
-    with torch.no_grad():
-        outputs = TRK_MODEL(**inputs, multimask_output=False)
+        with torch.no_grad():
+            outputs = TRK_MODEL(**inputs, multimask_output=False)
 
-    masks = TRK_PROCESSOR.post_process_masks(
-        outputs.pred_masks.cpu(),
-        inputs["original_sizes"],
-        binarize=True,
-    )[0]
+        masks = TRK_PROCESSOR.post_process_masks(
+            outputs.pred_masks.float().cpu(),
+            inputs["original_sizes"],
+            binarize=True,
+        )[0]
 
     if masks is None or len(masks) == 0:
         overlay = _draw_points_on_image(image, req.points)
@@ -479,13 +677,6 @@ def video(req: VideoRequest):
     if len(frames_rgb) == 0:
         raise HTTPException(400, "no readable frames in video")
 
-    session = VID_PROCESSOR.init_video_session(
-        video=frames_rgb,
-        inference_device=DEVICE,
-        dtype=VID_DTYPE,
-    )
-    session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=req.prompt)
-
     out_path = tempfile.mktemp(suffix=".mp4", prefix="sam3_video_", dir=VIDEO_OUT_DIR)
     writer = cv2.VideoWriter(
         out_path,
@@ -497,40 +688,48 @@ def video(req: VideoRequest):
     processed = 0
     masked = 0
 
-    for model_out in VID_MODEL.propagate_in_video_iterator(
-        inference_session=session,
-        max_frame_num_to_track=len(frames_rgb),
-    ):
-        post = VID_PROCESSOR.postprocess_outputs(session, model_out)
-        f_idx = model_out.frame_idx
-        frame_rgb = frames_rgb[f_idx]
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    with _INFER_LOCK:
+        session = VID_PROCESSOR.init_video_session(
+            video=frames_rgb,
+            inference_device=DEVICE,
+            dtype=VID_DTYPE,
+        )
+        session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=req.prompt)
 
-        masks = post.get("masks") if "masks" in post else None
-        if masks is not None and hasattr(masks, "ndim") and masks.ndim == 4:
-            masks = masks.squeeze(1)
+        for model_out in VID_MODEL.propagate_in_video_iterator(
+            inference_session=session,
+            max_frame_num_to_track=len(frames_rgb),
+        ):
+            post = VID_PROCESSOR.postprocess_outputs(session, model_out)
+            f_idx = model_out.frame_idx
+            frame_rgb = frames_rgb[f_idx]
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-        # Truthy check: tracker may return an empty (0, H, W) tensor for frames where
-        # no instance has been propagated yet — those should NOT count as "masked".
-        has_masks = masks is not None and getattr(masks, "shape", (0,))[0] > 0
+            masks = post.get("masks") if "masks" in post else None
+            if masks is not None and hasattr(masks, "ndim") and masks.ndim == 4:
+                masks = masks.squeeze(1)
 
-        if req.render_mode == "annotated":
-            if has_masks:
-                scores = post.get("scores", None)
-                out_bgr = _draw_video_masks_contours_and_boxes(frame_bgr, masks, req.prompt, scores=scores)
-                masked += 1
-            else:
-                out_bgr = frame_bgr
-        else:  # "mask"
-            if has_masks:
-                pil = _apply_mask_overlay(Image.fromarray(frame_rgb), masks)
-                out_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-                masked += 1
-            else:
-                out_bgr = frame_bgr
+            # Truthy check: tracker may return an empty (0, H, W) tensor for frames where
+            # no instance has been propagated yet — those should NOT count as "masked".
+            has_masks = masks is not None and getattr(masks, "shape", (0,))[0] > 0
 
-        writer.write(out_bgr)
-        processed += 1
+            if req.render_mode == "annotated":
+                if has_masks:
+                    scores = post.get("scores", None)
+                    out_bgr = _draw_video_masks_contours_and_boxes(frame_bgr, masks, req.prompt, scores=scores)
+                    masked += 1
+                else:
+                    out_bgr = frame_bgr
+            else:  # "mask"
+                if has_masks:
+                    pil = _apply_mask_overlay(Image.fromarray(frame_rgb), masks)
+                    out_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+                    masked += 1
+                else:
+                    out_bgr = frame_bgr
+
+            writer.write(out_bgr)
+            processed += 1
 
     writer.release()
 

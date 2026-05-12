@@ -14,33 +14,40 @@ MODELS_GEMMA := models/google/gemma-4-E2B-it
 DATA_DIR ?= /home/edward/research/lianzhong-project/data/反向教学教材
 OUT_DIR  ?= /home/edward/research/lianzhong-project/data/outputs/反向教学教材
 
-.PHONY: help dev dev-orchestrate run serve venv install models gemma-model download clean-venv clean-models status stop detect report \
-        docker-build docker-up docker-down docker-logs docker-restart docker-clean docker-shell
+.PHONY: help dev dev-stop dev-orchestrate run serve venv install models gemma-model download clean-venv clean-models status stop detect report \
+        docker-build docker-up docker-down docker-logs docker-restart docker-clean docker-shell \
+        deploy deploy-stop deploy-rebuild deploy-verify \
+        eval-blade
 
 help:
-	@echo "Targets:"
-	@echo "  make dev          — one-shot: stop + venv + deps + SAM3 model + start servers.py + run app.py"
-	@echo "  make serve        — launch SAM3 stateless service (servers.py) on $(SAM3_PORT) (foreground)"
+	@echo "Local development (paired):"
+	@echo "  make dev          — start:  venv + deps + SAM3 model + servers.py (bg) + app.py (fg)"
+	@echo "  make dev-stop     — stop:   kill app.py / servers.py, free ports $(PORT) / $(SAM3_PORT)"
+	@echo ""
+	@echo "Docker deployment (paired, fully offline image):"
+	@echo "  make deploy        — start: docker compose up -d + health check (uses existing sam3-cuda:latest, no rebuild)"
+	@echo "  make deploy-stop   — stop:  docker compose down"
+	@echo "  make deploy-rebuild — rebuild image first, then start (use after Dockerfile/requirements changes)"
+	@echo ""
+	@echo "Other:"
+	@echo "  make serve        — launch SAM3 stateless service only (servers.py) on $(SAM3_PORT) (foreground)"
 	@echo "  make run          — just launch app.py on $(PORT) (assumes servers.py is up)"
 	@echo "  make venv         — create .venv via uv"
 	@echo "  make install      — install torch (cu124) + requirements + spaces + gradio[mcp]"
 	@echo "  make models       — download facebook/sam3 into ./models (Gemma is no longer needed)"
 	@echo "  make gemma-model  — (optional, unused) download google/gemma-4-E2B-it"
-	@echo "  make stop         — kill any app.py / servers.py / anything on $(PORT) or $(SAM3_PORT)"
 	@echo "  make status       — show venv / models / port status"
 	@echo "  make clean-venv   — remove .venv"
 	@echo "  make clean-models — remove ./models (careful, re-downloads SAM3 ~10GB)"
 	@echo "  make detect       — batch-process images in DATA_DIR (needs serve)"
 	@echo "  make report       — generate HTML report from OUT_DIR/json/"
 	@echo ""
-	@echo "Docker (fully offline) targets:"
-	@echo "  make docker-build — build sam3-cuda:latest with SAM3 weights baked in (slow, ~15min)"
-	@echo "  make docker-up    — docker compose up -d  (single 'sam3' container, two processes)"
-	@echo "  make docker-down  — docker compose down"
-	@echo "  make docker-logs  — docker compose logs -f"
-	@echo "  make docker-restart — docker compose restart"
-	@echo "  make docker-shell — open bash inside the sam3 container for debugging"
-	@echo "  make docker-clean — docker compose down -v --rmi local (drops image)"
+	@echo "Docker low-level (rarely needed directly):"
+	@echo "  make docker-build / docker-up / docker-logs / docker-restart / docker-shell / docker-clean"
+	@echo ""
+	@echo "Aliases (kept for backward compatibility):"
+	@echo "  make stop         = make dev-stop"
+	@echo "  make docker-down  = make deploy-stop"
 
 dev: stop venv install models dev-orchestrate
 
@@ -66,10 +73,10 @@ dev-orchestrate:
 	@if ! curl -sf http://127.0.0.1:$(SAM3_PORT)/health 2>/dev/null | grep -q '"sam3_video":true'; then \
 		echo "[dev] timed out waiting for SAM3"; tail -30 /tmp/sam3-servers.log; exit 1; \
 	fi
-	@echo "[dev] launching app.py on $(PORT)  (Ctrl+C to stop app; servers.py keeps running — use 'make stop' to fully clean up)"
+	@echo "[dev] launching app.py on $(PORT)  (Ctrl+C to stop app; servers.py keeps running — use 'make dev-stop' to fully clean up)"
 	@if [ -f .env ]; then set -a; . <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env); set +a; fi; \
 	$(PY) app.py
-	@echo "[dev] app.py exited. servers.py still running on $(SAM3_PORT). Run 'make stop' to fully clean up."
+	@echo "[dev] app.py exited. servers.py still running on $(SAM3_PORT). Run 'make dev-stop' to fully clean up."
 
 venv: $(VENV)/bin/activate
 
@@ -143,6 +150,44 @@ docker-shell:
 docker-clean:
 	$(DC) down -v --rmi local
 
+# Default deploy: assume sam3-cuda:latest is already built (it bakes ~6.5GB SAM3
+# weights + CUDA base, so rebuilding is expensive). If the image is missing we
+# fail loudly and tell the user to run `make deploy-rebuild` (or `make docker-build`).
+# If you changed Dockerfile/requirements.txt, use `make deploy-rebuild`.
+deploy:
+	@if ! docker image inspect sam3-cuda:latest >/dev/null 2>&1; then \
+	  echo "[deploy] sam3-cuda:latest not found locally."; \
+	  echo "[deploy] Run 'make deploy-rebuild' to build it (slow, ~15min, pulls CUDA base)."; \
+	  exit 1; \
+	fi
+	@echo "[deploy] using existing sam3-cuda:latest (no rebuild)"
+	@$(MAKE) --no-print-directory docker-up
+	@$(MAKE) --no-print-directory deploy-verify
+
+deploy-rebuild: docker-build docker-up deploy-verify
+
+# Symmetric stop counterpart to `make deploy`. Alias of `make docker-down`.
+deploy-stop: docker-down
+
+deploy-verify:
+	@echo "[deploy] waiting for SAM3 API on host (up to 120s) ..."
+	@set -a; [ -f .env.docker ] && . ./.env.docker; set +a; \
+	SAM3=$${SAM3_HOST_PORT:-5050}; UI=$${GRADIO_HOST_PORT:-17860}; \
+	for i in $$(seq 1 60); do \
+	  if curl -sf "http://127.0.0.1:$$SAM3/health" 2>/dev/null | grep -q '"sam3_video":true'; then \
+	    echo "[deploy] SAM3 API ready at http://localhost:$$SAM3"; \
+	    echo "[deploy] Gradio UI: http://localhost:$$UI"; \
+	    echo "[deploy] SAM3 API: http://localhost:$$SAM3  (docs: docs/SAM3_API.md)"; \
+	    exit 0; \
+	  fi; \
+	  sleep 2; \
+	done; \
+	echo "[deploy] SAM3 API NOT ready within 120s — run 'make docker-logs' to inspect"; \
+	exit 1
+
+# Symmetric stop counterpart to `make dev`. Alias of `make stop`.
+dev-stop: stop
+
 stop:
 	@echo "[stop] killing app.py / servers.py processes..."
 	@pkill -f "python .*app\.py" 2>/dev/null; true
@@ -174,3 +219,14 @@ clean-venv:
 
 clean-models:
 	rm -rf models
+
+# ---------- blade defect evaluation ----------
+# Usage: make eval-blade DATASET=<path> PREDICTOR=dummy OUT=<path>
+PREDICTOR ?= dummy
+
+eval-blade:
+	@if [ -z "$(DATASET)" ] || [ -z "$(OUT)" ]; then \
+		echo "Usage: make eval-blade DATASET=<path> PREDICTOR=dummy OUT=<path>"; \
+		exit 2; \
+	fi
+	$(PY) -m scripts.blade --dataset "$(DATASET)" --predictor "$(PREDICTOR)" --out "$(OUT)"
