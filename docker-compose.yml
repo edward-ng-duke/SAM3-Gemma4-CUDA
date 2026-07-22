@@ -47,6 +47,12 @@ services:
       # after the next `make deploy-rebuild` bakes the fix in. See plan
       # /home/edward/.claude/plans/sam-api-sam3-radiant-stallman.md.
       - ./servers.py:/app/servers.py:ro
+      # Same overlay reason: the baked image (2026-05-12) still waits for
+      # "sam3_video":true, but startup_preload is "detect" so only sam3_image
+      # ever loads — the readiness probe timed out after 90s and killed the
+      # container in a loop. The host copy already greps "sam3_image":true.
+      # Remove this line after the next `make deploy-rebuild` bakes it in.
+      - ./entrypoint.sh:/app/entrypoint.sh:ro
       # # Uncomment to persist generated videos on the host:
       # - ./sam3_out:/var/sam3_data
     deploy:
@@ -60,11 +66,11 @@ services:
       test:
         - CMD-SHELL
         - >
-          curl -fs http://127.0.0.1:5050/health | grep -q '"sam3_video":true'
+          curl -fs http://127.0.0.1:5050/health | grep -q '"sam3_image":true'
           && curl -fs -o /dev/null http://127.0.0.1:7860/
       interval: 30s
       timeout: 5s
       retries: 3
-      # SAM3 cold-start (~30-45s) + Gradio (~5s) + buffer.
+      # SAM3 image cold-start + Gradio startup + buffer. Tracker/video load lazily.
       start_period: 120s
     restart: unless-stopped

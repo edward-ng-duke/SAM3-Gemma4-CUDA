@@ -22,7 +22,7 @@ trap 'echo "[entrypoint] received signal, terminating servers.py (pid ${SERVERS_
 
 echo "[entrypoint] waiting for SAM3 health on 127.0.0.1:${SAM3_PORT} (up to 90s) ..."
 for i in $(seq 1 45); do
-    if curl -sf "http://127.0.0.1:${SAM3_PORT}/health" 2>/dev/null | grep -q '"sam3_video":true'; then
+    if curl -sf "http://127.0.0.1:${SAM3_PORT}/health" 2>/dev/null | grep -q '"sam3_image":true'; then
         echo "[entrypoint] SAM3 ready after ~$((i * 2))s"
         break
     fi
@@ -33,7 +33,7 @@ for i in $(seq 1 45); do
     sleep 2
 done
 
-if ! curl -sf "http://127.0.0.1:${SAM3_PORT}/health" 2>/dev/null | grep -q '"sam3_video":true'; then
+if ! curl -sf "http://127.0.0.1:${SAM3_PORT}/health" 2>/dev/null | grep -q '"sam3_image":true'; then
     echo "[entrypoint] SAM3 not ready within 90s; see container logs above"
     kill -TERM "${SERVERS_PID}" 2>/dev/null || true
     exit 1
