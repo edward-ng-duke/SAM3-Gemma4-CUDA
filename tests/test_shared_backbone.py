@@ -11,7 +11,7 @@ import os
 def test_vision_encoder_is_shared():
     import sys; sys.path.insert(0, "/home/edward/research/SAM3-Gemma4-CUDA")
     import servers
-    servers._load_models()
+    servers._load_models("all")
     sam_ve = servers.SAM_MODEL.vision_encoder
     trk_ve = servers.TRK_MODEL.vision_encoder
     vid_ve = servers.VID_MODEL.detector_model.vision_encoder

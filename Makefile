@@ -59,7 +59,7 @@ dev-orchestrate:
 	@disown || true
 	@echo "[dev] waiting for SAM3 service on $(SAM3_PORT) (up to 90s) ..."
 	@for i in $$(seq 1 45); do \
-		if curl -sf http://127.0.0.1:$(SAM3_PORT)/health 2>/dev/null | grep -q '"sam3_video":true'; then \
+		if curl -sf http://127.0.0.1:$(SAM3_PORT)/health 2>/dev/null | grep -q '"sam3_image":true'; then \
 			echo "[dev] SAM3 service ready"; \
 			break; \
 		fi; \
@@ -70,7 +70,7 @@ dev-orchestrate:
 		fi; \
 		sleep 2; \
 	done
-	@if ! curl -sf http://127.0.0.1:$(SAM3_PORT)/health 2>/dev/null | grep -q '"sam3_video":true'; then \
+	@if ! curl -sf http://127.0.0.1:$(SAM3_PORT)/health 2>/dev/null | grep -q '"sam3_image":true'; then \
 		echo "[dev] timed out waiting for SAM3"; tail -30 /tmp/sam3-servers.log; exit 1; \
 	fi
 	@echo "[dev] launching app.py on $(PORT)  (Ctrl+C to stop app; servers.py keeps running — use 'make dev-stop' to fully clean up)"
@@ -174,7 +174,7 @@ deploy-verify:
 	@set -a; [ -f .env.docker ] && . ./.env.docker; set +a; \
 	SAM3=$${SAM3_HOST_PORT:-5050}; UI=$${GRADIO_HOST_PORT:-17860}; \
 	for i in $$(seq 1 60); do \
-	  if curl -sf "http://127.0.0.1:$$SAM3/health" 2>/dev/null | grep -q '"sam3_video":true'; then \
+	  if curl -sf "http://127.0.0.1:$$SAM3/health" 2>/dev/null | grep -q '"sam3_image":true'; then \
 	    echo "[deploy] SAM3 API ready at http://localhost:$$SAM3"; \
 	    echo "[deploy] Gradio UI: http://localhost:$$UI"; \
 	    echo "[deploy] SAM3 API: http://localhost:$$SAM3  (docs: docs/SAM3_API.md)"; \

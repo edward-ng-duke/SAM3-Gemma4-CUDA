@@ -18,7 +18,7 @@ opencv-python
 sentencepiece
 qwen-vl-utils
 pillow
-kernels
+kernels==0.14.0  # 0.16 破坏兼容(LayerRepository要revision)，勿裸装
 requests
 av
 hf_xet

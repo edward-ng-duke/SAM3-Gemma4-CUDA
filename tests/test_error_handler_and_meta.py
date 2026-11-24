@@ -175,10 +175,17 @@ def test_detect_handles_bfloat16_scores_and_masks(stub_models, monkeypatch):
     `TypeError: Got unsupported ScalarType BFloat16` on every WTBD request whose
     scores survived the threshold. detect() must cast to float32 first."""
     import torch
+    from types import SimpleNamespace
 
     class _BfModel:
         def __call__(self, **kw):
-            return object()
+            mask = torch.full((1, 1, 8, 8), -2.0, dtype=torch.bfloat16)
+            mask[:, :, :2, :2] = 2.0
+            return SimpleNamespace(
+                pred_logits=torch.tensor([[1.585]], dtype=torch.bfloat16),
+                presence_logits=None,
+                pred_masks=mask,
+            )
 
     class _BfProc:
         class _ImgProc:
@@ -199,19 +206,6 @@ def test_detect_handles_bfloat16_scores_and_masks(stub_models, monkeypatch):
                         return _T()
                     return d
             return _Batched()
-
-        def post_process_instance_segmentation(self, *a, **kw):
-            # Two regions: one fake bool mask, one bfloat16 score per region.
-            mask = torch.tensor([[[1, 1, 0, 0, 0, 0, 0, 0],
-                                  [1, 1, 0, 0, 0, 0, 0, 0],
-                                  [0, 0, 0, 0, 0, 0, 0, 0],
-                                  [0, 0, 0, 0, 0, 0, 0, 0],
-                                  [0, 0, 0, 0, 0, 0, 0, 0],
-                                  [0, 0, 0, 0, 0, 0, 0, 0],
-                                  [0, 0, 0, 0, 0, 0, 0, 0],
-                                  [0, 0, 0, 0, 0, 0, 0, 0]]], dtype=torch.bool)
-            scores = torch.tensor([0.83], dtype=torch.bfloat16)
-            return [{"masks": mask, "scores": scores}]
 
     monkeypatch.setattr(servers, "SAM_MODEL", _BfModel())
     monkeypatch.setattr(servers, "SAM_PROCESSOR", _BfProc())

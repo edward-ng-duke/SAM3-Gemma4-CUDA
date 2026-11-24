@@ -20,8 +20,12 @@ import os
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# 必须在第一次 CUDA 分配之前设置（即 import torch 之前）：expandable segments 让
+# empty_cache() 能真正把缓存还给驱动，而不是把峰值水位钉死在进程上。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import base64
+import gc
 import hashlib
 import io
 import logging
@@ -90,6 +94,8 @@ VID_PROCESSOR: Optional[Sam3VideoProcessor] = None
 
 # Populated at startup by _load_models(); cached so /health and /v1/sam3/config stay O(1).
 MODEL_META: dict[str, Any] = {}
+_WEIGHTS_SHA256: Optional[str] = None
+_WEIGHTS_SHA256_COMPUTED = False
 
 LOG_DIR = os.environ.get("SAM3_LOG_DIR", os.path.join(_HERE, "logs"))
 LOG_PATH = os.path.join(LOG_DIR, "sam3_server.log")
@@ -131,71 +137,43 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
-def _load_models():
-    global SAM_MODEL, SAM_PROCESSOR, TRK_MODEL, TRK_PROCESSOR, VID_MODEL, VID_PROCESSOR
+def _weights_path() -> str:
+    return os.path.join(SAM_MODEL_NAME, "model.safetensors")
 
-    print(f"[servers] device={DEVICE}, vid_dtype={VID_DTYPE}")
 
-    # 1) 一次性加载完整 Sam3VideoModel，覆盖 detector + tracker_video + tracker_neck
-    #    所有 namespace（detector_model.*, tracker_model.*, tracker_neck.*）都被 load。
-    print(f"[servers] loading Sam3VideoModel from {SAM_MODEL_NAME} (single source for all three endpoints) ...")
-    VID_MODEL = Sam3VideoModel.from_pretrained(SAM_MODEL_NAME, dtype=VID_DTYPE).to(DEVICE).eval()
-    VID_PROCESSOR = Sam3VideoProcessor.from_pretrained(SAM_MODEL_NAME)
+def _get_weights_sha256() -> Optional[str]:
+    """Hash model weights at most once; the file is several GB."""
+    global _WEIGHTS_SHA256, _WEIGHTS_SHA256_COMPUTED
+    if _WEIGHTS_SHA256_COMPUTED:
+        return _WEIGHTS_SHA256
 
-    # 2) /v1/sam3/detect 用的 Sam3Model = VID_MODEL.detector_model（共享，不复制）
-    SAM_MODEL = VID_MODEL.detector_model
-    SAM_PROCESSOR = Sam3Processor.from_pretrained(SAM_MODEL_NAME)
-
-    # 3) /v1/sam3/track 用的 Sam3TrackerModel：单独实例化（不同 forward 签名），
-    #    但把它的 vision_encoder 替换成 VID_MODEL.detector_model.vision_encoder 的同一引用。
-    print("[servers] building Sam3TrackerModel with SHARED vision_encoder (no extra backbone in VRAM) ...")
-    sam_cfg = AutoConfig.from_pretrained(SAM_MODEL_NAME)
-    trk_cfg = sam_cfg.tracker_config if hasattr(sam_cfg, "tracker_config") else sam_cfg
-    TRK_MODEL = Sam3TrackerModel(trk_cfg)
-    # 替换 vision_encoder 引用 —— 自动接入 nn.Module tree（PyTorch 标准行为）
-    del TRK_MODEL.vision_encoder
-    TRK_MODEL.vision_encoder = VID_MODEL.detector_model.vision_encoder
-
-    # 只 load tracker_model.* 部分权重（不含 vision_encoder，因为它已经共享自 detector）
-    raw_sd = load_safetensors(os.path.join(SAM_MODEL_NAME, "model.safetensors"))
-    tracker_sd = {
-        k[len("tracker_model."):]: v
-        for k, v in raw_sd.items()
-        if k.startswith("tracker_model.")
-    }
-    missing, unexpected = TRK_MODEL.load_state_dict(tracker_sd, strict=False)
-    # missing 必含所有 vision_encoder.* 键（这是预期的，它们走共享引用了）
-    vision_missing = [m for m in missing if m.startswith("vision_encoder.")]
-    other_missing = [m for m in missing if not m.startswith("vision_encoder.")]
-    print(
-        f"[servers] tracker: loaded {len(tracker_sd)} weights, "
-        f"{len(vision_missing)} vision_encoder.* missing (expected, shared), "
-        f"{len(other_missing)} other missing, {len(unexpected)} unexpected"
-    )
-    assert not other_missing, f"unexpected missing keys: {other_missing[:5]}"
-
-    # tracker 的非 vision_encoder 子模块需要搬上 device。.to(DEVICE) 会递归，
-    # 但共享的 vision_encoder 已经在 DEVICE 上，.to() 对它是 no-op（不会重复分配）。
-    TRK_MODEL = TRK_MODEL.to(DEVICE).eval()
-    TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(SAM_MODEL_NAME)
-
-    # 4) 健全性自检：vision_encoder 内存里只有 1 份（id 相同）
-    assert id(SAM_MODEL.vision_encoder) == id(TRK_MODEL.vision_encoder), "vision_encoder not shared between SAM and TRK"
-    print(f"[servers] vision_encoder backbone shared across detect/track/video (single VRAM copy)")
-
-    # 5) Build cached MODEL_META for /health and /v1/sam3/config. We hash the weights
-    #    once at startup; SHA-256 over a ~6 GB safetensors file takes ~10 s and is
-    #    skipped under SAM3_SKIP_WEIGHTS_HASH=1 for fast dev iteration.
-    global MODEL_META
-    weights_path = os.path.join(SAM_MODEL_NAME, "model.safetensors")
-    weights_sha256: Optional[str] = None
+    weights_path = _weights_path()
     if os.environ.get("SAM3_SKIP_WEIGHTS_HASH", "0") != "1" and os.path.exists(weights_path):
         h = hashlib.sha256()
         with open(weights_path, "rb") as f:
             for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
                 h.update(chunk)
-        weights_sha256 = h.hexdigest()
+        _WEIGHTS_SHA256 = h.hexdigest()
 
+    _WEIGHTS_SHA256_COMPUTED = True
+    return _WEIGHTS_SHA256
+
+
+def _vision_encoder_shared() -> bool:
+    encoders = []
+    if SAM_MODEL is not None and hasattr(SAM_MODEL, "vision_encoder"):
+        encoders.append(id(SAM_MODEL.vision_encoder))
+    if TRK_MODEL is not None and hasattr(TRK_MODEL, "vision_encoder"):
+        encoders.append(id(TRK_MODEL.vision_encoder))
+    if VID_MODEL is not None and hasattr(VID_MODEL, "detector_model"):
+        detector = VID_MODEL.detector_model
+        if hasattr(detector, "vision_encoder"):
+            encoders.append(id(detector.vision_encoder))
+    return len(set(encoders)) <= 1
+
+
+def _refresh_model_meta() -> None:
+    global MODEL_META
     cuda_cap = None
     cuda_device_name = None
     if torch.cuda.is_available():
@@ -207,29 +185,198 @@ def _load_models():
 
     MODEL_META = {
         "model_path": SAM_MODEL_NAME,
-        "weights_file": weights_path,
-        "weights_sha256": weights_sha256,
-        "sam3_image_class": type(SAM_MODEL).__name__,
-        "sam3_tracker_class": type(TRK_MODEL).__name__,
-        "sam3_video_class": type(VID_MODEL).__name__,
+        "weights_file": _weights_path(),
+        "weights_sha256": _get_weights_sha256(),
+        "sam3_image_class": type(SAM_MODEL).__name__ if SAM_MODEL is not None else None,
+        "sam3_tracker_class": type(TRK_MODEL).__name__ if TRK_MODEL is not None else None,
+        "sam3_video_class": type(VID_MODEL).__name__ if VID_MODEL is not None else None,
         "dtype": str(VID_DTYPE),
         "transformers_version": transformers.__version__,
         "torch_version": torch.__version__,
         "cuda_capability": cuda_cap,
         "cuda_device_name": cuda_device_name,
-        "vision_encoder_shared": True,  # asserted above; if assertion fails we never reach here
+        "vision_encoder_shared": _vision_encoder_shared(),
+        "startup_preload": os.environ.get("SAM3_PRELOAD", "detect"),
     }
+
+
+def _preload_targets(raw: Optional[str] = None) -> set[str]:
+    raw = (raw if raw is not None else os.environ.get("SAM3_PRELOAD", "detect")).strip().lower()
+    if raw in ("", "detect", "image", "sam3_image"):
+        return {"image"}
+    if raw in ("0", "false", "none", "off"):
+        return set()
+    if raw in ("1", "true", "all"):
+        return {"image", "tracker", "video"}
+
+    targets: set[str] = set()
+    for token in raw.replace("+", ",").split(","):
+        token = token.strip()
+        if token in ("detect", "image", "sam3_image"):
+            targets.add("image")
+        elif token in ("track", "tracker", "sam3_tracker"):
+            targets.update({"image", "tracker"})
+        elif token in ("video", "sam3_video"):
+            targets.add("video")
+        else:
+            raise ValueError(
+                "SAM3_PRELOAD must be one of detect, track, video, all, none, "
+                f"or a comma-separated combination; got {raw!r}"
+            )
+    return targets
+
+
+def _ensure_image_model() -> tuple[Sam3Model, Sam3Processor]:
+    global SAM_MODEL, SAM_PROCESSOR
+    if SAM_MODEL is None:
+        if VID_MODEL is not None:
+            SAM_MODEL = VID_MODEL.detector_model
+        else:
+            print(f"[servers] loading Sam3Model from {SAM_MODEL_NAME} ...")
+            SAM_MODEL = Sam3Model.from_pretrained(SAM_MODEL_NAME, dtype=VID_DTYPE).to(DEVICE).eval()
+    if SAM_PROCESSOR is None:
+        SAM_PROCESSOR = Sam3Processor.from_pretrained(SAM_MODEL_NAME)
+    _refresh_model_meta()
+    return SAM_MODEL, SAM_PROCESSOR
+
+
+def _ensure_video_model() -> tuple[Sam3VideoModel, Sam3VideoProcessor]:
+    global SAM_MODEL, SAM_PROCESSOR, TRK_MODEL, TRK_PROCESSOR, VID_MODEL, VID_PROCESSOR
+    if VID_MODEL is None:
+        # If the service started in lightweight detect-only mode, drop the standalone
+        # detector/tracker before upgrading so we do not retain two backbones.
+        if SAM_MODEL is not None or TRK_MODEL is not None:
+            print("[servers] upgrading to Sam3VideoModel; releasing standalone image/tracker models first ...")
+            SAM_MODEL = None
+            TRK_MODEL = None
+            TRK_PROCESSOR = None
+            gc.collect()
+            _release_cached_vram(0)
+
+        print(f"[servers] loading Sam3VideoModel from {SAM_MODEL_NAME} ...")
+        VID_MODEL = Sam3VideoModel.from_pretrained(SAM_MODEL_NAME, dtype=VID_DTYPE).to(DEVICE).eval()
+        VID_PROCESSOR = Sam3VideoProcessor.from_pretrained(SAM_MODEL_NAME)
+        SAM_MODEL = VID_MODEL.detector_model
+    if VID_PROCESSOR is None:
+        VID_PROCESSOR = Sam3VideoProcessor.from_pretrained(SAM_MODEL_NAME)
+    if SAM_PROCESSOR is None:
+        SAM_PROCESSOR = Sam3Processor.from_pretrained(SAM_MODEL_NAME)
+    _refresh_model_meta()
+    return VID_MODEL, VID_PROCESSOR
+
+
+def _ensure_tracker_model() -> tuple[Sam3TrackerModel, Sam3TrackerProcessor]:
+    global TRK_MODEL, TRK_PROCESSOR
+    if TRK_MODEL is None:
+        sam_model, _ = _ensure_image_model()
+        print("[servers] building Sam3TrackerModel with SHARED vision_encoder (no extra backbone in VRAM) ...")
+        sam_cfg = AutoConfig.from_pretrained(SAM_MODEL_NAME)
+        trk_cfg = sam_cfg.tracker_config if hasattr(sam_cfg, "tracker_config") else sam_cfg
+        TRK_MODEL = Sam3TrackerModel(trk_cfg)
+        del TRK_MODEL.vision_encoder
+        TRK_MODEL.vision_encoder = sam_model.vision_encoder
+
+        raw_sd = load_safetensors(_weights_path())
+        tracker_sd = {
+            k[len("tracker_model."):]: v
+            for k, v in raw_sd.items()
+            if k.startswith("tracker_model.")
+        }
+        missing, unexpected = TRK_MODEL.load_state_dict(tracker_sd, strict=False)
+        vision_missing = [m for m in missing if m.startswith("vision_encoder.")]
+        other_missing = [m for m in missing if not m.startswith("vision_encoder.")]
+        print(
+            f"[servers] tracker: loaded {len(tracker_sd)} weights, "
+            f"{len(vision_missing)} vision_encoder.* missing (expected, shared), "
+            f"{len(other_missing)} other missing, {len(unexpected)} unexpected"
+        )
+        assert not other_missing, f"unexpected missing keys: {other_missing[:5]}"
+        del raw_sd, tracker_sd
+
+        # tracker 的非 vision_encoder 部分搬上 device，参数统一成 VID_DTYPE：按 config
+        # 构建的 TRK_MODEL 是 float32，而共享 vision_encoder 输出 bf16 特征，不转换的话
+        # forward 在 neck 处报 "Input type (c10::BFloat16) and bias type (float) should
+        # be the same"。两个约束：
+        #   1) 只转参数、不转 buffer —— 与 from_pretrained(dtype=...) 语义一致，
+        #      RoPE cos/sin 等 buffer 必须保持 fp32；
+        #   2) 不能对整树 .to(dtype=...) —— 会递归把共享 vision_encoder 的 64 个 fp32
+        #      RoPE buffer 降成 bf16，改变 /detect 的检测结果（实测同图 46→42）。
+        TRK_MODEL = TRK_MODEL.to(DEVICE)
+        for _name, _param in TRK_MODEL.named_parameters():
+            if not _name.startswith("vision_encoder.") and _param.is_floating_point():
+                _param.data = _param.data.to(VID_DTYPE)
+        TRK_MODEL = TRK_MODEL.eval()
+        gc.collect()
+        _release_cached_vram(0)
+
+    if TRK_PROCESSOR is None:
+        TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(SAM_MODEL_NAME)
+    assert SAM_MODEL is None or id(SAM_MODEL.vision_encoder) == id(TRK_MODEL.vision_encoder), (
+        "vision_encoder not shared between SAM and TRK"
+    )
+    _refresh_model_meta()
+    return TRK_MODEL, TRK_PROCESSOR
+
+
+def _load_models(preload: Optional[str] = None) -> None:
+    print(f"[servers] device={DEVICE}, vid_dtype={VID_DTYPE}")
+    targets = _preload_targets(preload)
+    if "video" in targets:
+        _ensure_video_model()
+    if "image" in targets:
+        _ensure_image_model()
+    if "tracker" in targets:
+        _ensure_tracker_model()
+    _refresh_model_meta()
+
+    weights_sha256 = MODEL_META.get("weights_sha256")
     logger.info(
-        "models ready: class=%s, dtype=%s, weights_sha256=%s, transformers=%s",
-        MODEL_META["sam3_image_class"],
+        "models ready: preload=%s loaded(image=%s tracker=%s video=%s), dtype=%s, weights_sha256=%s, transformers=%s",
+        preload if preload is not None else os.environ.get("SAM3_PRELOAD", "detect"),
+        SAM_MODEL is not None,
+        TRK_MODEL is not None,
+        VID_MODEL is not None,
         MODEL_META["dtype"],
         (weights_sha256[:12] + "...") if weights_sha256 else "skipped",
         transformers.__version__,
     )
-    print("[servers] all SAM3 models ready.")
+    print(
+        "[servers] SAM3 startup preload complete: "
+        f"image={SAM_MODEL is not None}, tracker={TRK_MODEL is not None}, video={VID_MODEL is not None}."
+    )
 
 
 # ---------- helpers ----------
+
+
+def _release_cached_vram(min_waste_bytes: int = 1 << 30) -> None:
+    """请求结束后把"已缓存但未分配"的显存还给驱动。
+
+    caching allocator 默认终生保留单次请求的峰值（nvidia-smi 上表现为"泄漏"），
+    会挤压同卡其他进程。只在差额超过阈值时触发，小请求的热缓存不受影响。
+    """
+    if not torch.cuda.is_available():
+        return
+    if torch.cuda.memory_reserved() - torch.cuda.memory_allocated() >= min_waste_bytes:
+        torch.cuda.empty_cache()
+
+
+def _filter_masks_to_cpu(outputs, conf_threshold: float) -> list[tuple[float, np.ndarray]]:
+    """按分数过滤检测结果，把保留的低分辨率 mask（sigmoid 后 float32）搬到 CPU。
+
+    取代 SAM_PROCESSOR.post_process_instance_segmentation(..., target_sizes=...)：
+    那个实现会在 GPU 上把全部保留 mask 一次性插值到原图分辨率（float32）再以
+    int64 二值化——大图多目标时单次请求瞬时分配 >10 GB，且峰值被 allocator
+    永久驻留。这里只做它的过滤部分（数学完全一致），上采样推迟到 detect() 里
+    在 CPU 上逐 mask 进行，显存/内存峰值都控制在每 mask 几十 MB。
+    """
+    scores = outputs.pred_logits[0].sigmoid()
+    if getattr(outputs, "presence_logits", None) is not None:
+        scores = scores * outputs.presence_logits[0].sigmoid()
+    keep = scores > conf_threshold
+    kept_scores = scores[keep].float().cpu().numpy()
+    kept_masks = outputs.pred_masks[0][keep].sigmoid().float().cpu().numpy()
+    return [(float(s), m) for s, m in zip(kept_scores, kept_masks)]
 
 
 def _decode_b64_image(b64: str) -> Image.Image:
@@ -557,8 +704,6 @@ def sam3_config():
 
 @app.post("/v1/sam3/detect", response_model=DetectResponse)
 def detect(req: DetectRequest):
-    if SAM_MODEL is None or SAM_PROCESSOR is None:
-        raise HTTPException(503, "SAM3 image model not loaded")
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(400, "prompt is required")
 
@@ -566,40 +711,26 @@ def detect(req: DetectRequest):
     w, h = image.size
 
     with _INFER_LOCK:
-        inputs = SAM_PROCESSOR(images=image, text=req.prompt, return_tensors="pt").to(DEVICE)
+        sam_model, sam_processor = _ensure_image_model()
+        inputs = sam_processor(images=image, text=req.prompt, return_tensors="pt").to(DEVICE)
         with torch.no_grad():
-            outputs = SAM_MODEL(**inputs)
-
-        processed = SAM_PROCESSOR.post_process_instance_segmentation(
-            outputs,
-            threshold=float(req.conf_threshold),
-            mask_threshold=float(req.mask_threshold),
-            target_sizes=inputs.get("original_sizes").tolist(),
-        )[0]
-
-    raw_masks = processed.get("masks")
-    raw_scores = processed.get("scores")
-    if raw_masks is None or raw_scores is None or len(raw_scores) == 0:
-        return DetectResponse(width=w, height=h, regions=[])
-
-    # .float() casts bfloat16 → float32; numpy has no bfloat16 dtype and would raise
-    # `TypeError: Got unsupported ScalarType BFloat16` on .numpy(). The model runs in
-    # VID_DTYPE=bfloat16, so any path where scores survive the threshold reaches here.
-    masks_np = raw_masks.detach().float().cpu().numpy()
-    scores_np = raw_scores.detach().float().cpu().numpy()
+            outputs = sam_model(**inputs)
+        scored_masks = _filter_masks_to_cpu(outputs, float(req.conf_threshold))
+        del inputs, outputs
+        _release_cached_vram()
 
     regions: list[Region] = []
-    for idx, mask in enumerate(masks_np):
-        if mask.ndim == 3:
-            mask = np.squeeze(mask, axis=0)
-        ys, xs = np.where(mask > 0)
+    for score, mask_lowres in scored_masks:
+        # 与库实现同序：先 bilinear 上采样 sigmoid 浮点 mask，再按 mask_threshold 二值化。
+        mask = cv2.resize(mask_lowres, (w, h), interpolation=cv2.INTER_LINEAR) > float(req.mask_threshold)
+        ys, xs = np.where(mask)
         if len(xs) == 0 or len(ys) == 0:
             continue
         bbox = _clamp_box_xyxy([xs.min(), ys.min(), xs.max(), ys.max()], w, h)
         regions.append(Region(
             region_index=len(regions),
             bbox=bbox,
-            score=float(scores_np[idx]),
+            score=score,
             mask_b64=_encode_mask_b64_png(mask) if req.return_masks else None,
         ))
 
@@ -608,8 +739,6 @@ def detect(req: DetectRequest):
 
 @app.post("/v1/sam3/track", response_model=TrackResponse)
 def track(req: TrackRequest):
-    if TRK_MODEL is None or TRK_PROCESSOR is None:
-        raise HTTPException(503, "SAM3 tracker model not loaded")
     if len(req.points) == 0:
         raise HTTPException(400, "points must not be empty")
     if len(req.points) != len(req.labels):
@@ -621,7 +750,8 @@ def track(req: TrackRequest):
     input_labels = [[req.labels]]
 
     with _INFER_LOCK:
-        inputs = TRK_PROCESSOR(
+        trk_model, trk_processor = _ensure_tracker_model()
+        inputs = trk_processor(
             images=image,
             input_points=input_points,
             input_labels=input_labels,
@@ -629,13 +759,15 @@ def track(req: TrackRequest):
         ).to(DEVICE)
 
         with torch.no_grad():
-            outputs = TRK_MODEL(**inputs, multimask_output=False)
+            outputs = trk_model(**inputs, multimask_output=False)
 
-        masks = TRK_PROCESSOR.post_process_masks(
+        masks = trk_processor.post_process_masks(
             outputs.pred_masks.float().cpu(),
             inputs["original_sizes"],
             binarize=True,
         )[0]
+        del inputs, outputs
+        _release_cached_vram()
 
     if masks is None or len(masks) == 0:
         overlay = _draw_points_on_image(image, req.points)
@@ -648,8 +780,6 @@ def track(req: TrackRequest):
 
 @app.post("/v1/sam3/video", response_model=VideoResponse)
 def video(req: VideoRequest):
-    if VID_MODEL is None or VID_PROCESSOR is None:
-        raise HTTPException(503, "SAM3 video model not loaded")
     if not req.video_path or not os.path.isfile(req.video_path):
         raise HTTPException(400, f"video_path not readable: {req.video_path}")
     if not req.prompt or not req.prompt.strip():
@@ -689,18 +819,19 @@ def video(req: VideoRequest):
     masked = 0
 
     with _INFER_LOCK:
-        session = VID_PROCESSOR.init_video_session(
+        vid_model, vid_processor = _ensure_video_model()
+        session = vid_processor.init_video_session(
             video=frames_rgb,
             inference_device=DEVICE,
             dtype=VID_DTYPE,
         )
-        session = VID_PROCESSOR.add_text_prompt(inference_session=session, text=req.prompt)
+        session = vid_processor.add_text_prompt(inference_session=session, text=req.prompt)
 
-        for model_out in VID_MODEL.propagate_in_video_iterator(
+        for model_out in vid_model.propagate_in_video_iterator(
             inference_session=session,
             max_frame_num_to_track=len(frames_rgb),
         ):
-            post = VID_PROCESSOR.postprocess_outputs(session, model_out)
+            post = vid_processor.postprocess_outputs(session, model_out)
             f_idx = model_out.frame_idx
             frame_rgb = frames_rgb[f_idx]
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -730,6 +861,11 @@ def video(req: VideoRequest):
 
             writer.write(out_bgr)
             processed += 1
+
+        # session 持有全部帧张量 + 各 frame 的 vision feature 缓存（随帧数可达数 GB），
+        # 在锁内显式释放，避免峰值驻留到下一个请求。
+        del session
+        _release_cached_vram()
 
     writer.release()
 
